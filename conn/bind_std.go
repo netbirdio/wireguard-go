@@ -42,6 +42,14 @@ type StdNetBind struct {
 
 	blackhole4 bool
 	blackhole6 bool
+
+	receiverCreator ReceiverCreator
+}
+
+func NewStdNetBindWithReceiverCreator(receiverCreator ReceiverCreator) *StdNetBind {
+	b, _ := NewStdNetBind().(*StdNetBind)
+	b.receiverCreator = receiverCreator
+	return b
 }
 
 func NewStdNetBind() Bind {
@@ -59,7 +67,7 @@ func NewStdNetBind() Bind {
 				msgs := make([]ipv4.Message, IdealBatchSize)
 				for i := range msgs {
 					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, srcControlSize)
+					msgs[i].OOB = make([]byte, SrcControlSize)
 				}
 				return &msgs
 			},
@@ -70,7 +78,7 @@ func NewStdNetBind() Bind {
 				msgs := make([]ipv6.Message, IdealBatchSize)
 				for i := range msgs {
 					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, srcControlSize)
+					msgs[i].OOB = make([]byte, SrcControlSize)
 				}
 				return &msgs
 			},
@@ -192,7 +200,11 @@ again:
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
 		}
-		fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn))
+		if s.receiverCreator != nil {
+			fns = append(fns, s.receiverCreator.CreateIPv4ReceiverFn(&s.ipv4MsgsPool, v4pc, v4conn))
+		} else {
+			fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn))
+		}
 		s.ipv4 = v4conn
 	}
 	if v6conn != nil {
@@ -236,7 +248,7 @@ func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn) Rec
 			sizes[i] = msg.N
 			addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
 			ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
-			getSrcFromControl(msg.OOB[:msg.NN], ep)
+			GetSrcFromControl(msg.OOB[:msg.NN], ep)
 			eps[i] = ep
 		}
 		return numMsgs, nil
@@ -269,7 +281,7 @@ func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn) Rec
 			sizes[i] = msg.N
 			addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
 			ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
-			getSrcFromControl(msg.OOB[:msg.NN], ep)
+			GetSrcFromControl(msg.OOB[:msg.NN], ep)
 			eps[i] = ep
 		}
 		return numMsgs, nil

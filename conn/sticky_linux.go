@@ -14,9 +14,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// getSrcFromControl parses the control for PKTINFO and if found updates ep with
+// GetSrcFromControl parses the control for PKTINFO and if found updates ep with
 // the source information found.
-func getSrcFromControl(control []byte, ep *StdNetEndpoint) {
+func GetSrcFromControl(control []byte, ep *StdNetEndpoint) {
 	ep.ClearSrc()
 
 	var (
@@ -80,7 +80,7 @@ func setSrcControl(control *[]byte, ep *StdNetEndpoint) {
 		return
 	}
 
-	if len(*control) < srcControlSize {
+	if len(*control) < SrcControlSize {
 		*control = (*control)[:0]
 		return
 	}
@@ -112,6 +112,6 @@ func setSrcControl(control *[]byte, ep *StdNetEndpoint) {
 
 }
 
-var srcControlSize = unix.CmsgSpace(unix.SizeofInet6Pktinfo)
+var SrcControlSize = unix.CmsgSpace(unix.SizeofInet6Pktinfo)
 
 const StdNetSupportsStickySockets = true
