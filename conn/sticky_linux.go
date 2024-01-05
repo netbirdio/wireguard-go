@@ -103,37 +103,6 @@ func setSrcControl(control *[]byte, ep *StdNetEndpoint) {
 	}
 	*control = (*control)[:0]
 	*control = append(*control, ep.src...)
-
-	if len(*control) < StickyControlSize {
-		*control = (*control)[:0]
-		return
-	}
-
-	hdr := (*unix.Cmsghdr)(unsafe.Pointer(&(*control)[0]))
-	if ep.SrcIP().Is4() {
-		hdr.Level = unix.IPPROTO_IP
-		hdr.Type = unix.IP_PKTINFO
-		hdr.SetLen(unix.CmsgLen(unix.SizeofInet4Pktinfo))
-
-		info := (*unix.Inet4Pktinfo)(unsafe.Pointer(&(*control)[unix.SizeofCmsghdr]))
-		info.Ifindex = ep.src.ifidx
-		if ep.SrcIP().IsValid() {
-			info.Spec_dst = ep.SrcIP().As4()
-		}
-		*control = (*control)[:unix.CmsgSpace(unix.SizeofInet4Pktinfo)]
-	} else {
-		hdr.Level = unix.IPPROTO_IPV6
-		hdr.Type = unix.IPV6_PKTINFO
-		hdr.SetLen(unix.CmsgLen(unix.SizeofInet6Pktinfo))
-
-		info := (*unix.Inet6Pktinfo)(unsafe.Pointer(&(*control)[unix.SizeofCmsghdr]))
-		info.Ifindex = uint32(ep.src.ifidx)
-		if ep.SrcIP().IsValid() {
-			info.Addr = ep.SrcIP().As16()
-		}
-		*control = (*control)[:unix.CmsgSpace(unix.SizeofInet6Pktinfo)]
-	}
-
 }
 
 // stickyControlSize returns the recommended buffer size for pooling sticky
