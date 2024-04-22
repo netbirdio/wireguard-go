@@ -9,4 +9,5 @@ import (
 
 type ReceiverCreator interface {
 	CreateIPv4ReceiverFn(msgPool *sync.Pool, pc *ipv4.PacketConn, conn *net.UDPConn) ReceiveFunc
+	CreateRelayReceiverFn(msgPool *sync.Pool) ReceiveFunc
 }

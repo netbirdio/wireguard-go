@@ -9,6 +9,7 @@ package conn
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"reflect"
 	"runtime"
@@ -82,6 +83,7 @@ type Endpoint interface {
 	DstToBytes() []byte  // used for mac2 cookie calculations
 	DstIP() netip.Addr
 	SrcIP() netip.Addr
+	GetConn() net.PacketConn
 }
 
 var (

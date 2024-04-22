@@ -84,6 +84,7 @@ func NewStdNetBind() Bind {
 type StdNetEndpoint struct {
 	// AddrPort is the endpoint destination.
 	netip.AddrPort
+	Conn net.PacketConn
 	// src is the current sticky source address and interface index, if
 	// supported. Typically this is a PKTINFO structure from/for control
 	// messages, see unix.PKTINFO for an example.
@@ -125,6 +126,10 @@ func (e *StdNetEndpoint) DstToBytes() []byte {
 
 func (e *StdNetEndpoint) DstToString() string {
 	return e.AddrPort.String()
+}
+
+func (e *StdNetEndpoint) GetConn() net.PacketConn {
+	return e.Conn
 }
 
 func listenNet(network string, port int) (*net.UDPConn, int, error) {
@@ -190,6 +195,10 @@ again:
 		if s.receiverCreator != nil {
 			// Todo: check if this still works
 			fns = append(fns, s.receiverCreator.CreateIPv4ReceiverFn(&s.msgsPool, v4pc, v4conn))
+			turnFn := s.receiverCreator.CreateRelayReceiverFn(&s.msgsPool)
+			if turnFn != nil {
+				fns = append(fns, s.receiverCreator.CreateRelayReceiverFn(&s.msgsPool))
+			}
 		} else {
 			fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
 		}
@@ -395,7 +404,11 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 retry:
 	if offload {
 		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, *msgs, setGSOSize)
-		err = s.send(conn, br, (*msgs)[:n])
+		if endpoint.GetConn() != nil {
+			err = s.sendPacketConn(endpoint.GetConn(), (*msgs)[:n])
+		} else {
+			err = s.send(conn, br, (*msgs)[:n])
+		}
 		if err != nil && offload && errShouldDisableUDPGSO(err) {
 			offload = false
 			s.mu.Lock()
@@ -414,12 +427,26 @@ retry:
 			(*msgs)[i].Buffers[0] = bufs[i]
 			setSrcControl(&(*msgs)[i].OOB, endpoint.(*StdNetEndpoint))
 		}
-		err = s.send(conn, br, (*msgs)[:len(bufs)])
+		if endpoint.GetConn() != nil {
+			err = s.sendPacketConn(endpoint.GetConn(), (*msgs)[:len(bufs)])
+		} else {
+			err = s.send(conn, br, (*msgs)[:len(bufs)])
+		}
 	}
 	if retried {
 		return ErrUDPGSODisabled{onLaddr: conn.LocalAddr().String(), RetryErr: err}
 	}
 	return err
+}
+
+func (s *StdNetBind) sendPacketConn(conn net.PacketConn, msgs []ipv6.Message) error {
+	for _, msg := range msgs {
+		_, err := conn.WriteTo(msg.Buffers[0], msg.Addr.(*net.UDPAddr))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *StdNetBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) error {
