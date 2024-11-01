@@ -211,6 +211,16 @@ again:
 	return fns, uint16(port), nil
 }
 
+func (s *StdNetBind) IPv4Conn() *net.UDPConn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.ipv4 != nil {
+		return s.ipv4
+	}
+	return nil
+}
+
 func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
 	for i := range *msgs {
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
