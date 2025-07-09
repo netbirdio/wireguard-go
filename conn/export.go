@@ -14,3 +14,5 @@ var (
 	// is not thread safe and should only be modified during init.
 	ControlFns = &controlFns
 )
+
+type BatchReader = batchReader
