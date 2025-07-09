@@ -188,8 +188,7 @@ again:
 			s.ipv4PC = v4pc
 		}
 		if s.receiverCreator != nil {
-			// Todo: check if this still works
-			fns = append(fns, s.receiverCreator.CreateIPv4ReceiverFn(v4pc, v4conn, s.ipv4RxOffload, &s.msgsPool))
+			fns = append(fns, s.receiverCreator.CreateReceiverFn(v4pc, v4conn, s.ipv4RxOffload, &s.msgsPool))
 		} else {
 			fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
 		}
@@ -201,7 +200,11 @@ again:
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
 		}
-		fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
+		if s.receiverCreator != nil {
+			fns = append(fns, s.receiverCreator.CreateReceiverFn(v6pc, v6conn, s.ipv6RxOffload, &s.msgsPool))
+		} else {
+			fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
+		}
 		s.ipv6 = v6conn
 	}
 	if len(fns) == 0 {
