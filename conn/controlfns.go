@@ -26,10 +26,9 @@ type controlFn func(network, address string, c syscall.RawConn) error
 // that can apply socket options.
 var controlFns = []controlFn{}
 
-// listenConfig returns a net.ListenConfig that applies the controlFns to the
-// socket prior to bind. This is used to apply socket buffer sizing and packet
-// information OOB configuration for sticky sockets.
-func listenConfig() *net.ListenConfig {
+// listenConfigFn is a function that returns a net.ListenConfig.
+// It can be replaced to use alternative network stacks.
+var listenConfigFn = func() *net.ListenConfig {
 	return &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			for _, fn := range controlFns {
@@ -40,4 +39,11 @@ func listenConfig() *net.ListenConfig {
 			return nil
 		},
 	}
+}
+
+// listenConfig returns a net.ListenConfig that applies the controlFns to the
+// socket prior to bind. This is used to apply socket buffer sizing and packet
+// information OOB configuration for sticky sockets.
+func listenConfig() *net.ListenConfig {
+	return listenConfigFn()
 }
