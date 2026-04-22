@@ -10,23 +10,24 @@ import (
 )
 
 type WaitPool struct {
-	pool  sync.Pool
-	cond  sync.Cond
-	lock  sync.Mutex
-	count uint32 // Get calls not yet Put back
-	max   uint32
+	pool    sync.Pool
+	cond    sync.Cond
+	lock    sync.Mutex
+	count   uint32 // Get calls not yet Put back
+	max     uint32
+	tracked bool // true if max was non-zero at construction; enables SetMax
 }
 
 func NewWaitPool(max uint32, new func() any) *WaitPool {
-	p := &WaitPool{pool: sync.Pool{New: new}, max: max}
+	p := &WaitPool{pool: sync.Pool{New: new}, max: max, tracked: max != 0}
 	p.cond = sync.Cond{L: &p.lock}
 	return p
 }
 
 func (p *WaitPool) Get() any {
-	if p.max != 0 {
+	if p.tracked {
 		p.lock.Lock()
-		for p.count >= p.max {
+		for p.max != 0 && p.count >= p.max {
 			p.cond.Wait()
 		}
 		p.count++
@@ -37,13 +38,26 @@ func (p *WaitPool) Get() any {
 
 func (p *WaitPool) Put(x any) {
 	p.pool.Put(x)
-	if p.max == 0 {
+	if !p.tracked {
 		return
 	}
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	p.count--
 	p.cond.Signal()
+}
+
+// SetMax updates the pool cap. Takes effect immediately; waiters are
+// broadcast so they re-check against the new value. Has no effect if the
+// pool was constructed with max == 0 (unbounded, fast-path Get/Put).
+func (p *WaitPool) SetMax(n uint32) {
+	if !p.tracked {
+		return
+	}
+	p.lock.Lock()
+	p.max = n
+	p.cond.Broadcast()
+	p.lock.Unlock()
 }
 
 func (device *Device) PopulatePools() {
