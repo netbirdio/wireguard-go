@@ -7,8 +7,10 @@ package device
 
 // MaxBatchSizeOverride, when nonzero, replaces the per-Device batch size used
 // to size eager buffer allocations in RoutineReceiveIncoming and
-// RoutineReadFromTUN. Changes affect Devices created after this assignment.
-// Use SetMaxBatchSizeOverride to change it safely at runtime.
+// RoutineReadFromTUN. Zero means "do not override" (Devices fall back to the
+// larger of bind.BatchSize() and tun.BatchSize()); zero is NOT "unlimited".
+// Changes affect Devices created after this assignment; use
+// SetMaxBatchSizeOverride to set it.
 var MaxBatchSizeOverride uint32 = 0
 
 // SetPreallocatedBuffersPerPool sets the cap on the number of buffers held by
