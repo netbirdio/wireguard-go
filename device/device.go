@@ -307,6 +307,10 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 
+	if MaxBatchSizeOverride > 0 {
+		device.batchSizeOverride.Store(int32(MaxBatchSizeOverride))
+	}
+
 	device.PopulatePools()
 
 	// create queues
