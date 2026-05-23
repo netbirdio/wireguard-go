@@ -92,6 +92,12 @@ type Device struct {
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger
+
+	// batchSizeOverride, when nonzero, replaces the value returned by
+	// BatchSize and is used to size per-goroutine eager buffer allocations.
+	// Must be set before calling Up so that the first bind/receive goroutines
+	// pick it up.
+	batchSizeOverride atomic.Int32
 }
 
 // deviceState represents the state of a Device.
@@ -301,6 +307,10 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 
+	if MaxBatchSizeOverride > 0 {
+		device.batchSizeOverride.Store(int32(MaxBatchSizeOverride))
+	}
+
 	device.PopulatePools()
 
 	// create queues
@@ -331,14 +341,30 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 // BatchSize returns the BatchSize for the device as a whole which is the max of
 // the bind batch size and the tun batch size. The batch size reported by device
 // is the size used to construct memory pools, and is the allowed batch size for
-// the lifetime of the device.
+// the lifetime of the device. A nonzero override set via SetMaxBatchSize
+// takes precedence and is returned as-is.
 func (device *Device) BatchSize() int {
+	if o := device.batchSizeOverride.Load(); o > 0 {
+		return int(o)
+	}
 	size := device.net.bind.BatchSize()
 	dSize := device.tun.device.BatchSize()
 	if size < dSize {
 		size = dSize
 	}
 	return size
+}
+
+// SetMaxBatchSize overrides the per-batch size used by the receive and TUN
+// read goroutines, and therefore the number of message buffers each of them
+// holds eagerly for the lifetime of the Device. Zero disables the override.
+// Must be called before Up; already-running goroutines keep the batch size
+// they started with.
+func (device *Device) SetMaxBatchSize(n int) {
+	if n < 0 {
+		n = 0
+	}
+	device.batchSizeOverride.Store(int32(n))
 }
 
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
@@ -522,7 +548,7 @@ func (device *Device) BindUpdate() error {
 	device.net.stopping.Add(len(recvFns))
 	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
 	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
-	batchSize := netc.bind.BatchSize()
+	batchSize := device.BatchSize()
 	for _, fn := range recvFns {
 		go device.RoutineReceiveIncoming(batchSize, fn)
 	}
