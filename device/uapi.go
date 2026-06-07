@@ -268,7 +268,7 @@ func (peer *ipcSetPeer) handlePostConfig() {
 		if peer.pkaOn {
 			peer.SendKeepalive()
 		}
-		if peer.endpointChanged {
+		if peer.endpointChanged && peer.needsHandshake() {
 			peer.SendHandshakeInitiationOnEndpointChange()
 		}
 		peer.SendStagedPackets()
