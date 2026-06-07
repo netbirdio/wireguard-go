@@ -253,7 +253,7 @@ type ipcSetPeer struct {
 	dummy           bool // dummy reports whether this peer is a temporary, placeholder peer
 	created         bool // new reports whether this is a newly created peer
 	pkaOn           bool // pkaOn reports whether the peer had the persistent keepalive turn on
-	endpointChanged bool // endpointChanged reports whether the endpoint address changed
+	endpointChanged bool // the endpoint address changed
 }
 
 func (peer *ipcSetPeer) handlePostConfig() {
@@ -269,7 +269,7 @@ func (peer *ipcSetPeer) handlePostConfig() {
 			peer.SendKeepalive()
 		}
 		if peer.endpointChanged {
-			peer.SendImmediateHandshakeInitiation()
+			peer.SendHandshakeInitiationOnEndpointChange()
 		}
 		peer.SendStagedPackets()
 	}
@@ -348,8 +348,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
 		}
 		peer.endpoint.Lock()
-		// Trigger an immediate handshake only when an existing endpoint changes;
-		// the initial assignment is left to the normal SendStagedPackets path.
+		// Only an actual change of an existing endpoint triggers a handshake.
 		if peer.endpoint.val != nil && peer.endpoint.val.DstToString() != endpoint.DstToString() {
 			peer.endpointChanged = true
 		}

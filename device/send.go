@@ -16,6 +16,7 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -115,6 +116,12 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
+	return peer.sendHandshakeInitiation()
+}
+
+// sendHandshakeInitiation transmits the initiation; the caller owns the
+// RekeyTimeout throttle and lastSentHandshake.
+func (peer *Peer) sendHandshakeInitiation() error {
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
@@ -139,14 +146,17 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	return err
 }
 
-// SendImmediateHandshakeInitiation resets the RekeyTimeout throttle and sends a
-// handshake initiation right away. Used when the endpoint just changed.
-func (peer *Peer) SendImmediateHandshakeInitiation() error {
+// SendHandshakeInitiationOnEndpointChange starts a fresh handshake from the new
+// endpoint, skipping the RekeyTimeout throttle since any in-flight retry is
+// timed against the old address.
+func (peer *Peer) SendHandshakeInitiationOnEndpointChange() error {
+	peer.timers.handshakeAttempts.Store(0)
+
 	peer.handshake.mutex.Lock()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
+	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	return peer.SendHandshakeInitiation(false)
+	return peer.sendHandshakeInitiation()
 }
 
 func (peer *Peer) SendHandshakeResponse() error {
