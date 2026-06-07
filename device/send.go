@@ -139,6 +139,16 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	return err
 }
 
+// SendImmediateHandshakeInitiation resets the RekeyTimeout throttle and sends a
+// handshake initiation right away. Used when the endpoint just changed.
+func (peer *Peer) SendImmediateHandshakeInitiation() error {
+	peer.handshake.mutex.Lock()
+	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
+	peer.handshake.mutex.Unlock()
+
+	return peer.SendHandshakeInitiation(false)
+}
+
 func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now()
