@@ -37,8 +37,8 @@ type Stack interface {
 	ListenTCPAddrPort(addr netip.AddrPort) (TCPListener, error)
 	DialUDPAddrPort(laddr, raddr netip.AddrPort) (UDPConn, error)
 	ListenUDPAddrPort(laddr netip.AddrPort) (UDPConn, error)
-	DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error)
-	ListenPingAddr(laddr netip.Addr) (*PingConn, error)
+	DialPingAddr(laddr, raddr netip.Addr) (PingConn, error)
+	ListenPingAddr(laddr netip.Addr) (PingConn, error)
 	LookupContextHost(ctx context.Context, host string) ([]string, error)
 }
 
@@ -77,6 +77,41 @@ type TCPListener interface {
 	Addr() net.Addr
 	Close() error
 	Shutdown()
+}
+
+// PingConn is the ICMP "ping" connection returned by the ping methods. It is both a
+// [net.Conn] (Read/Write against the dialed peer) and supports addressed I/O via
+// ReadFrom/WriteTo. The gvisor backend returns a concrete implementation; the lneto
+// backend does not implement ping and returns an error.
+type PingConn interface {
+	net.Conn
+	ReadFrom(p []byte) (int, net.Addr, error)
+	WriteTo(p []byte, addr net.Addr) (int, error)
+}
+
+// PingAddr is a [net.Addr] for the "ping" pseudo-networks. It wraps a bare
+// [netip.Addr] (no port) and is backend-neutral.
+type PingAddr struct{ addr netip.Addr }
+
+func (ia PingAddr) String() string {
+	return ia.addr.String()
+}
+
+func (ia PingAddr) Network() string {
+	if ia.addr.Is4() {
+		return "ping4"
+	} else if ia.addr.Is6() {
+		return "ping6"
+	}
+	return "ping"
+}
+
+func (ia PingAddr) Addr() netip.Addr {
+	return ia.addr
+}
+
+func PingAddrFromAddr(addr netip.Addr) *PingAddr {
+	return &PingAddr{addr}
 }
 
 // --- TCP ---
@@ -146,15 +181,15 @@ func (n *Net) ListenUDP(laddr *net.UDPAddr) (UDPConn, error) {
 
 // --- Ping ---
 
-func (n *Net) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
+func (n *Net) DialPingAddr(laddr, raddr netip.Addr) (PingConn, error) {
 	return n.stack.DialPingAddr(laddr, raddr)
 }
 
-func (n *Net) ListenPingAddr(laddr netip.Addr) (*PingConn, error) {
+func (n *Net) ListenPingAddr(laddr netip.Addr) (PingConn, error) {
 	return n.stack.ListenPingAddr(laddr)
 }
 
-func (n *Net) DialPing(laddr, raddr *PingAddr) (*PingConn, error) {
+func (n *Net) DialPing(laddr, raddr *PingAddr) (PingConn, error) {
 	var la, ra netip.Addr
 	if laddr != nil {
 		la = laddr.addr
@@ -165,7 +200,7 @@ func (n *Net) DialPing(laddr, raddr *PingAddr) (*PingConn, error) {
 	return n.stack.DialPingAddr(la, ra)
 }
 
-func (n *Net) ListenPing(laddr *PingAddr) (*PingConn, error) {
+func (n *Net) ListenPing(laddr *PingAddr) (PingConn, error) {
 	var la netip.Addr
 	if laddr != nil {
 		la = laddr.addr

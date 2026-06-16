@@ -384,12 +384,12 @@ func (n *lnetoStack) DialUDPAddrPort(laddr, raddr netip.AddrPort) (UDPConn, erro
 
 // --- Ping ---
 
-func (n *lnetoStack) DialPingAddr(_, _ netip.Addr) (*PingConn, error) {
-	return nil, errors.New("ping not implemented for lnetoStack: PingConn is gvisor-coupled")
+func (n *lnetoStack) DialPingAddr(_, _ netip.Addr) (PingConn, error) {
+	return nil, errors.New("ping not implemented for lnetoStack")
 }
 
-func (n *lnetoStack) ListenPingAddr(_ netip.Addr) (*PingConn, error) {
-	return nil, errors.New("ping not implemented for lnetoStack: PingConn is gvisor-coupled")
+func (n *lnetoStack) ListenPingAddr(_ netip.Addr) (PingConn, error) {
+	return nil, errors.New("ping not implemented for lnetoStack")
 }
 
 // --- DNS ---

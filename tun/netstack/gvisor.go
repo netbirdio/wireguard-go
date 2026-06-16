@@ -48,7 +48,7 @@ type netTun struct {
 	hasV4, hasV6   bool
 }
 
-func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
+func CreateNetTUNGvisor(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
@@ -254,7 +254,8 @@ func (tun *netTun) ListenUDPAddrPort(laddr netip.AddrPort) (UDPConn, error) {
 	return tun.DialUDPAddrPort(laddr, netip.AddrPort{})
 }
 
-type PingConn struct {
+// pingConn is the gvisor-backed [PingConn] implementation.
+type pingConn struct {
 	laddr    PingAddr
 	raddr    PingAddr
 	wq       waiter.Queue
@@ -262,30 +263,7 @@ type PingConn struct {
 	deadline *time.Timer
 }
 
-type PingAddr struct{ addr netip.Addr }
-
-func (ia PingAddr) String() string {
-	return ia.addr.String()
-}
-
-func (ia PingAddr) Network() string {
-	if ia.addr.Is4() {
-		return "ping4"
-	} else if ia.addr.Is6() {
-		return "ping6"
-	}
-	return "ping"
-}
-
-func (ia PingAddr) Addr() netip.Addr {
-	return ia.addr
-}
-
-func PingAddrFromAddr(addr netip.Addr) *PingAddr {
-	return &PingAddr{addr}
-}
-
-func (tun *netTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
+func (tun *netTun) DialPingAddr(laddr, raddr netip.Addr) (PingConn, error) {
 	if !laddr.IsValid() && !raddr.IsValid() {
 		return nil, errors.New("ping dial: invalid address")
 	}
@@ -306,7 +284,7 @@ func (tun *netTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
 		pn = ipv6.ProtocolNumber
 	}
 
-	pc := &PingConn{
+	pc := &pingConn{
 		laddr:    PingAddr{laddr},
 		deadline: time.NewTimer(time.Hour << 10),
 	}
@@ -336,29 +314,29 @@ func (tun *netTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
 	return pc, nil
 }
 
-func (tun *netTun) ListenPingAddr(laddr netip.Addr) (*PingConn, error) {
+func (tun *netTun) ListenPingAddr(laddr netip.Addr) (PingConn, error) {
 	return tun.DialPingAddr(laddr, netip.Addr{})
 }
 
-func (pc *PingConn) LocalAddr() net.Addr {
+func (pc *pingConn) LocalAddr() net.Addr {
 	return pc.laddr
 }
 
-func (pc *PingConn) RemoteAddr() net.Addr {
+func (pc *pingConn) RemoteAddr() net.Addr {
 	return pc.raddr
 }
 
-func (pc *PingConn) Close() error {
+func (pc *pingConn) Close() error {
 	pc.deadline.Reset(0)
 	pc.ep.Close()
 	return nil
 }
 
-func (pc *PingConn) SetWriteDeadline(t time.Time) error {
+func (pc *pingConn) SetWriteDeadline(t time.Time) error {
 	return errors.New("not implemented")
 }
 
-func (pc *PingConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+func (pc *pingConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	var na netip.Addr
 	switch v := addr.(type) {
 	case *PingAddr:
@@ -385,11 +363,11 @@ func (pc *PingConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return int(n64), nil
 }
 
-func (pc *PingConn) Write(p []byte) (n int, err error) {
+func (pc *pingConn) Write(p []byte) (n int, err error) {
 	return pc.WriteTo(p, &pc.raddr)
 }
 
-func (pc *PingConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+func (pc *pingConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	e, notifyCh := waiter.NewChannelEntry(waiter.EventIn)
 	pc.wq.EventRegister(&e)
 	defer pc.wq.EventUnregister(&e)
@@ -413,18 +391,18 @@ func (pc *PingConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	return res.Count, &PingAddr{remoteAddr}, nil
 }
 
-func (pc *PingConn) Read(p []byte) (n int, err error) {
+func (pc *pingConn) Read(p []byte) (n int, err error) {
 	n, _, err = pc.ReadFrom(p)
 	return
 }
 
-func (pc *PingConn) SetDeadline(t time.Time) error {
+func (pc *pingConn) SetDeadline(t time.Time) error {
 	// pc.SetWriteDeadline is unimplemented
 
 	return pc.SetReadDeadline(t)
 }
 
-func (pc *PingConn) SetReadDeadline(t time.Time) error {
+func (pc *pingConn) SetReadDeadline(t time.Time) error {
 	pc.deadline.Reset(time.Until(t))
 	return nil
 }
