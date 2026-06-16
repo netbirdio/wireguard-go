@@ -18,10 +18,10 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// TestNet2_Construct is a regression test: the previous CreateNetTUN2 omitted
+// TestNet2_Construct is a regression test: the previous CreateNetTUNLneto omitted
 // TCPPoolConfig.NewBackoff, which made StackGo panic at construction.
 func TestNet2_Construct(t *testing.T) {
-	dev, net2, err := CreateNetTUN2(
+	dev, net2, err := CreateNetTUNLneto(
 		[]netip.Addr{netip.MustParseAddr("10.0.0.1")},
 		[]netip.Addr{netip.MustParseAddr("8.8.8.8")},
 		1500,
@@ -31,7 +31,7 @@ func TestNet2_Construct(t *testing.T) {
 	}
 	defer dev.Close()
 	if net2 == nil {
-		t.Fatal("nil Net2")
+		t.Fatal("nil Net")
 	}
 	select {
 	case ev := <-dev.Events():
@@ -47,7 +47,7 @@ func TestNet2_Construct(t *testing.T) {
 // panicked with "send on closed channel". Run with -race.
 func TestNet2_CloseRace(t *testing.T) {
 	for i := 0; i < 50; i++ {
-		dev, _, err := CreateNetTUN2(
+		dev, _, err := CreateNetTUNLneto(
 			[]netip.Addr{netip.MustParseAddr("10.0.0.1")},
 			nil, 1500,
 		)
@@ -98,7 +98,7 @@ func TestNet2_CloseRace(t *testing.T) {
 // TestNet2_ListenTCPPort0 covers gap D: listening on port 0 must auto-assign an
 // ephemeral port instead of failing (the library previously returned ErrZeroSource).
 func TestNet2_ListenTCPPort0(t *testing.T) {
-	dev, net2, err := CreateNetTUN2([]netip.Addr{netip.MustParseAddr("10.0.0.1")}, nil, 1500)
+	dev, net2, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr("10.0.0.1")}, nil, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,11 +123,11 @@ func TestNet2_UDPEcho(t *testing.T) {
 		addrB = "10.0.0.2"
 		port  = 9999
 	)
-	devA, netA, err := CreateNetTUN2([]netip.Addr{netip.MustParseAddr(addrA)}, nil, 1500)
+	devA, netA, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr(addrA)}, nil, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	devB, netB, err := CreateNetTUN2([]netip.Addr{netip.MustParseAddr(addrB)}, nil, 1500)
+	devB, netB, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr(addrB)}, nil, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,11 +216,11 @@ func TestNet2_TCPEcho(t *testing.T) {
 
 func testTCPEcho(t *testing.T, addrA, addrB string) {
 	const port = 1234
-	devA, netA, err := CreateNetTUN2([]netip.Addr{netip.MustParseAddr(addrA)}, nil, 1500)
+	devA, netA, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr(addrA)}, nil, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	devB, netB, err := CreateNetTUN2([]netip.Addr{netip.MustParseAddr(addrB)}, nil, 1500)
+	devB, netB, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr(addrB)}, nil, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
