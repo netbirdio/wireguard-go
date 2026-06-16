@@ -39,6 +39,8 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+type Net netTun
+
 type netTun struct {
 	ep             *channel.Endpoint
 	stack          *stack.Stack
@@ -49,8 +51,6 @@ type netTun struct {
 	dnsServers     []netip.Addr
 	hasV4, hasV6   bool
 }
-
-type Net netTun
 
 func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
 	opts := stack.Options{
