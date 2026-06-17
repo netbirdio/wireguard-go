@@ -129,6 +129,7 @@ func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 		return 0, err
 	}
 	sizes[0] = n
+	debugIPPacket(true, buf[0][offset:offset+n])
 	return 1, nil
 }
 
@@ -138,6 +139,7 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 		if len(packet) == 0 {
 			continue
 		}
+		debugIPPacket(false, packet)
 
 		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
 		switch packet[0] >> 4 {

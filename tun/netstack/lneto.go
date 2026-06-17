@@ -110,11 +110,16 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 		return nil, nil, fmt.Errorf("CreateNetTUNLneto: stack reset: %w", err)
 	}
 
-	// GOMAXPROCS-aware backoff: on a single-threaded runtime only yield cooperatively
-	// (sleeping the poll would starve egress), otherwise sleep with exponential backoff.
+	// Backoff selection. A native single-threaded runtime (GOMAXPROCS==1) only yields
+	// cooperatively, because sleeping the poll would starve egress — there is no other
+	// thread to drain it. js/wasm is also single-threaded but is the opposite case: it
+	// MUST sleep so the runtime hands control back to the browser event loop (a bare
+	// Gosched there starves all WebSocket/WireGuard I/O and freezes the tab). So js,
+	// like the multi-threaded case, keeps the exponential sleeping backoffs — applied
+	// to BOTH the stack poll and every per-connection RWBackoff.
 	baseStack := defaultStackBackoff
 	newTCPBackoff := func() lneto.BackoffStrategy { return defaultTCPBackoff }
-	if runtime.GOMAXPROCS(0) == 1 {
+	if runtime.GOMAXPROCS(0) == 1 && runtime.GOOS != "js" {
 		baseStack = backoffYield
 		newTCPBackoff = func() lneto.BackoffStrategy { return backoffYield }
 	}
@@ -270,6 +275,7 @@ func (n *lnetoStack) Write(bufs [][]byte, offset int) (int, error) {
 	for _, buf := range bufs {
 		if pkt := buf[offset:]; len(pkt) > 0 {
 			n.sa.IngressIP(pkt) // errors dropped; stack silently filters bad packets
+			debugIPPacket(false, pkt)
 			wrote = true
 		}
 	}
@@ -295,6 +301,7 @@ func (n *lnetoStack) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 		cnt, _ := n.sa.EgressIP(dst)
 		if cnt > 0 {
 			sizes[0] = cnt
+			debugIPPacket(true, dst[:cnt])
 			return 1, nil
 		}
 		n.backoff.Do(backoffs) // interruptible; returns promptly when interrupt fires.
