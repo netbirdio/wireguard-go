@@ -283,6 +283,7 @@ func (n *Net) DialContext(ctx context.Context, network, address string) (net.Con
 		}
 
 		dialCtx := ctx
+		var cancel context.CancelFunc
 		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
 			partialDeadline, err := partialDeadline(time.Now(), deadline, len(addrs)-i)
 			if err != nil {
@@ -292,9 +293,7 @@ func (n *Net) DialContext(ctx context.Context, network, address string) (net.Con
 				break
 			}
 			if partialDeadline.Before(deadline) {
-				var cancel context.CancelFunc
 				dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
-				defer cancel()
 			}
 		}
 
@@ -306,6 +305,10 @@ func (n *Net) DialContext(ctx context.Context, network, address string) (net.Con
 			c, err = n.DialUDPAddrPort(netip.AddrPort{}, addr)
 		case "ping":
 			c, err = n.DialPingAddr(netip.Addr{}, addr.Addr())
+		}
+		if cancel != nil {
+			// This cancel belongs to a function-local context so cancel required to avoid leaks.
+			cancel()
 		}
 		if err == nil {
 			return c, nil

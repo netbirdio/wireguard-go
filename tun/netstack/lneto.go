@@ -30,6 +30,9 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 	if mtu <= 0 {
 		mtu = 1500
 	}
+	if mtu > 65535 {
+		return nil, nil, fmt.Errorf("CreateNetTUNLneto: mtu %d exceeds maximum 65535", mtu)
+	}
 	dev := &lnetoStack{
 		events:     make(chan tun.Event, 10),
 		closed:     make(chan struct{}),
