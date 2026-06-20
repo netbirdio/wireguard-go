@@ -137,6 +137,8 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 			ClosingTimeout:     10 * time.Second,
 			NewBackoff:         newTCPBackoff, // required: StackGo panics if nil.
 		},
+		TCPDialTimeout: time.Second,
+		TCPDialRetries: 30,
 	})
 	dev.events <- tun.EventUp
 	return dev, &Net{stack: dev}, nil
