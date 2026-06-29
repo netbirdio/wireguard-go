@@ -8,53 +8,69 @@ package device
 import (
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"hash"
 
-	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/curve25519"
 )
+
+// mac128Size is the size in bytes of the 128-bit MAC used in the cookie protocol.
+const mac128Size = 16
+
+// truncatedHash wraps a hash.Hash and truncates its output to mac128Size bytes.
+type truncatedHash struct {
+	hash.Hash
+}
+
+func (h *truncatedHash) Sum(b []byte) []byte {
+	full := h.Hash.Sum(nil)
+	return append(b, full[:mac128Size]...)
+}
+
+func (h *truncatedHash) Size() int {
+	return mac128Size
+}
+
+// newHMACSHA256_128 returns a hash.Hash computing HMAC-SHA256 truncated to 16 bytes.
+func newHMACSHA256_128(key []byte) hash.Hash {
+	return &truncatedHash{hmac.New(sha256.New, key)}
+}
 
 /* KDF related functions.
  * HMAC-based Key Derivation Function (HKDF)
  * https://tools.ietf.org/html/rfc5869
  */
 
-func HMAC1(sum *[blake2s.Size]byte, key, in0 []byte) {
-	mac := hmac.New(func() hash.Hash {
-		h, _ := blake2s.New256(nil)
-		return h
-	}, key)
+func HMAC1(sum *[sha256.Size]byte, key, in0 []byte) {
+	mac := hmac.New(sha256.New, key)
 	mac.Write(in0)
 	mac.Sum(sum[:0])
 }
 
-func HMAC2(sum *[blake2s.Size]byte, key, in0, in1 []byte) {
-	mac := hmac.New(func() hash.Hash {
-		h, _ := blake2s.New256(nil)
-		return h
-	}, key)
+func HMAC2(sum *[sha256.Size]byte, key, in0, in1 []byte) {
+	mac := hmac.New(sha256.New, key)
 	mac.Write(in0)
 	mac.Write(in1)
 	mac.Sum(sum[:0])
 }
 
-func KDF1(t0 *[blake2s.Size]byte, key, input []byte) {
+func KDF1(t0 *[sha256.Size]byte, key, input []byte) {
 	HMAC1(t0, key, input)
 	HMAC1(t0, t0[:], []byte{0x1})
 }
 
-func KDF2(t0, t1 *[blake2s.Size]byte, key, input []byte) {
-	var prk [blake2s.Size]byte
+func KDF2(t0, t1 *[sha256.Size]byte, key, input []byte) {
+	var prk [sha256.Size]byte
 	HMAC1(&prk, key, input)
 	HMAC1(t0, prk[:], []byte{0x1})
 	HMAC2(t1, prk[:], t0[:], []byte{0x2})
 	setZero(prk[:])
 }
 
-func KDF3(t0, t1, t2 *[blake2s.Size]byte, key, input []byte) {
-	var prk [blake2s.Size]byte
+func KDF3(t0, t1, t2 *[sha256.Size]byte, key, input []byte) {
+	var prk [sha256.Size]byte
 	HMAC1(&prk, key, input)
 	HMAC1(t0, prk[:], []byte{0x1})
 	HMAC2(t1, prk[:], t0[:], []byte{0x2})

@@ -12,7 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/blake2s"
+	"crypto/sha256"
+
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
 
@@ -47,7 +48,7 @@ func (hs handshakeState) String() string {
 }
 
 const (
-	NoiseConstruction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+	NoiseConstruction = "Noise_IKpsk2_25519_ChaChaPoly_SHA256"
 	WGIdentifier      = "WireGuard v1 zx2c4 Jason@zx2c4.com"
 	WGLabelMAC1       = "mac1----"
 	WGLabelCookie     = "cookie--"
@@ -88,8 +89,8 @@ type MessageInitiation struct {
 	Ephemeral NoisePublicKey
 	Static    [NoisePublicKeySize + poly1305.TagSize]byte
 	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	MAC1      [mac128Size]byte
+	MAC2      [mac128Size]byte
 }
 
 type MessageResponse struct {
@@ -98,8 +99,8 @@ type MessageResponse struct {
 	Receiver  uint32
 	Ephemeral NoisePublicKey
 	Empty     [poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	MAC1      [mac128Size]byte
+	MAC2      [mac128Size]byte
 }
 
 type MessageTransport struct {
@@ -113,7 +114,7 @@ type MessageCookieReply struct {
 	Type     uint32
 	Receiver uint32
 	Nonce    [chacha20poly1305.NonceSizeX]byte
-	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+	Cookie   [mac128Size + poly1305.TagSize]byte
 }
 
 var errMessageLengthMismatch = errors.New("message length mismatch")
@@ -211,8 +212,8 @@ func (msg *MessageCookieReply) marshal(b []byte) error {
 type Handshake struct {
 	state                     handshakeState
 	mutex                     sync.RWMutex
-	hash                      [blake2s.Size]byte       // hash value
-	chainKey                  [blake2s.Size]byte       // chain key
+	hash                      [sha256.Size]byte // hash value
+	chainKey                  [sha256.Size]byte // chain key
 	presharedKey              NoisePresharedKey        // psk
 	localEphemeral            NoisePrivateKey          // ephemeral secret key
 	localIndex                uint32                   // used to clear hash-table
@@ -226,17 +227,17 @@ type Handshake struct {
 }
 
 var (
-	InitialChainKey [blake2s.Size]byte
-	InitialHash     [blake2s.Size]byte
+	InitialChainKey [sha256.Size]byte
+	InitialHash     [sha256.Size]byte
 	ZeroNonce       [chacha20poly1305.NonceSize]byte
 )
 
-func mixKey(dst, c *[blake2s.Size]byte, data []byte) {
+func mixKey(dst, c *[sha256.Size]byte, data []byte) {
 	KDF1(dst, c[:], data)
 }
 
-func mixHash(dst, h *[blake2s.Size]byte, data []byte) {
-	hash, _ := blake2s.New256(nil)
+func mixHash(dst, h *[sha256.Size]byte, data []byte) {
+	hash := sha256.New()
 	hash.Write(h[:])
 	hash.Write(data)
 	hash.Sum(dst[:0])
@@ -263,7 +264,7 @@ func (h *Handshake) mixKey(data []byte) {
 /* Do basic precomputations
  */
 func init() {
-	InitialChainKey = blake2s.Sum256([]byte(NoiseConstruction))
+	InitialChainKey = sha256.Sum256([]byte(NoiseConstruction))
 	mixHash(&InitialHash, &InitialChainKey, []byte(WGIdentifier))
 }
 
@@ -339,8 +340,8 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 
 func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	var (
-		hash     [blake2s.Size]byte
-		chainKey [blake2s.Size]byte
+		hash     [sha256.Size]byte
+		chainKey [sha256.Size]byte
 	)
 
 	if msg.Type != MessageInitiationType {
@@ -487,7 +488,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 
 	// add preshared key
 
-	var tau [blake2s.Size]byte
+	var tau [sha256.Size]byte
 	var key [chacha20poly1305.KeySize]byte
 
 	KDF3(
@@ -523,8 +524,8 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	}
 
 	var (
-		hash     [blake2s.Size]byte
-		chainKey [blake2s.Size]byte
+		hash     [sha256.Size]byte
+		chainKey [sha256.Size]byte
 	)
 
 	ok := func() bool {
@@ -563,7 +564,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 
 		// add preshared key (psk)
 
-		var tau [blake2s.Size]byte
+		var tau [sha256.Size]byte
 		var key [chacha20poly1305.KeySize]byte
 		KDF3(
 			&chainKey,
