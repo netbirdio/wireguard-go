@@ -11,8 +11,6 @@ import (
 	"crypto/sha256"
 	"sync"
 	"time"
-
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 type CookieChecker struct {
@@ -23,7 +21,7 @@ type CookieChecker struct {
 	mac2 struct {
 		secret        [sha256.Size]byte
 		secretSet     time.Time
-		encryptionKey [chacha20poly1305.KeySize]byte
+		encryptionKey [aeadKeySize]byte
 	}
 }
 
@@ -37,7 +35,7 @@ type CookieGenerator struct {
 		cookieSet     time.Time
 		hasLastMAC1   bool
 		lastMAC1      [mac128Size]byte
-		encryptionKey [chacha20poly1305.KeySize]byte
+		encryptionKey [aeadKeySize]byte
 	}
 }
 
@@ -162,7 +160,7 @@ func (st *CookieChecker) CreateReply(
 		return nil, err
 	}
 
-	xchapoly, _ := chacha20poly1305.NewX(st.mac2.encryptionKey[:])
+	xchapoly := newAESGCM(st.mac2.encryptionKey[:])
 	xchapoly.Seal(reply.Cookie[:0], reply.Nonce[:], cookie[:], msg[smac1:smac2])
 
 	st.RUnlock()
@@ -201,7 +199,7 @@ func (st *CookieGenerator) ConsumeReply(msg *MessageCookieReply) bool {
 
 	var cookie [mac128Size]byte
 
-	xchapoly, _ := chacha20poly1305.NewX(st.mac2.encryptionKey[:])
+	xchapoly := newAESGCM(st.mac2.encryptionKey[:])
 	_, err := xchapoly.Open(cookie[:0], msg.Nonce[:], msg.Cookie[:], st.mac2.lastMAC1[:])
 	if err != nil {
 		return false

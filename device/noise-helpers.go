@@ -6,6 +6,8 @@
 package device
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,8 +18,19 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
-// mac128Size is the size in bytes of the 128-bit MAC used in the cookie protocol.
-const mac128Size = 16
+const (
+	mac128Size    = 16 // 128-bit MAC size for cookie protocol
+	aeadKeySize   = 32 // AES-256-GCM key size
+	aeadNonceSize = 12 // AES-GCM standard nonce size
+	aeadTagSize   = 16 // AES-GCM authentication tag size
+)
+
+// newAESGCM returns an AES-256-GCM AEAD cipher for the given 32-byte key.
+func newAESGCM(key []byte) cipher.AEAD {
+	block, _ := aes.NewCipher(key)
+	aead, _ := cipher.NewGCM(block)
+	return aead
+}
 
 // truncatedHash wraps a hash.Hash and truncates its output to mac128Size bytes.
 type truncatedHash struct {
