@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	NoisePublicKeySize    = 32
-	NoisePrivateKeySize   = 32
+	NoisePublicKeySize    = 65 // P-256 uncompressed public key (0x04 || x || y)
+	NoisePrivateKeySize   = 32 // P-256 private scalar
 	NoisePresharedKeySize = 32
+	NoiseSharedSecretSize = 32 // P-256 ECDH shared secret (x-coordinate)
 )
 
 type (
@@ -45,19 +46,12 @@ func (key NoisePrivateKey) Equals(tar NoisePrivateKey) bool {
 	return subtle.ConstantTimeCompare(key[:], tar[:]) == 1
 }
 
-func (key *NoisePrivateKey) FromHex(src string) (err error) {
-	err = loadExactHex(key[:], src)
-	key.clamp()
-	return
+func (key *NoisePrivateKey) FromHex(src string) error {
+	return loadExactHex(key[:], src)
 }
 
-func (key *NoisePrivateKey) FromMaybeZeroHex(src string) (err error) {
-	err = loadExactHex(key[:], src)
-	if key.IsZero() {
-		return
-	}
-	key.clamp()
-	return
+func (key *NoisePrivateKey) FromMaybeZeroHex(src string) error {
+	return loadExactHex(key[:], src)
 }
 
 func (key *NoisePublicKey) FromHex(src string) error {
