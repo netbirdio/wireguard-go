@@ -8,14 +8,13 @@ package device
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"hash"
-
-	"golang.org/x/crypto/curve25519"
 )
 
 const (
@@ -106,32 +105,39 @@ func setZero(arr []byte) {
 	}
 }
 
-func (sk *NoisePrivateKey) clamp() {
-	sk[0] &= 248
-	sk[31] = (sk[31] & 127) | 64
-}
+var errInvalidPublicKey = errors.New("invalid public key")
 
 func newPrivateKey() (sk NoisePrivateKey, err error) {
-	_, err = rand.Read(sk[:])
-	sk.clamp()
+	priv, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		return
+	}
+	copy(sk[:], priv.Bytes())
 	return
 }
 
 func (sk *NoisePrivateKey) publicKey() (pk NoisePublicKey) {
-	apk := (*[NoisePublicKeySize]byte)(&pk)
-	ask := (*[NoisePrivateKeySize]byte)(sk)
-	curve25519.ScalarBaseMult(apk, ask)
+	priv, err := ecdh.P256().NewPrivateKey(sk[:])
+	if err != nil {
+		return
+	}
+	copy(pk[:], priv.PublicKey().Bytes())
 	return
 }
 
-var errInvalidPublicKey = errors.New("invalid public key")
-
-func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoisePublicKeySize]byte, err error) {
-	apk := (*[NoisePublicKeySize]byte)(&pk)
-	ask := (*[NoisePrivateKeySize]byte)(sk)
-	curve25519.ScalarMult(&ss, ask, apk)
-	if isZero(ss[:]) {
+func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoiseSharedSecretSize]byte, err error) {
+	priv, err := ecdh.P256().NewPrivateKey(sk[:])
+	if err != nil {
 		return ss, errInvalidPublicKey
 	}
-	return ss, nil
+	pub, err := ecdh.P256().NewPublicKey(pk[:])
+	if err != nil {
+		return ss, errInvalidPublicKey
+	}
+	shared, err := priv.ECDH(pub)
+	if err != nil {
+		return ss, errInvalidPublicKey
+	}
+	copy(ss[:], shared)
+	return
 }

@@ -59,8 +59,8 @@ const (
 )
 
 const (
-	MessageInitiationSize      = 148                                           // size of handshake initiation message
-	MessageResponseSize        = 92                                            // size of response message
+	MessageInitiationSize      = 214                                           // size of handshake initiation message
+	MessageResponseSize        = 125                                           // size of response message
 	MessageCookieReplySize     = 52                                            // size of cookie reply message
 	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
 	MessageTransportSize       = MessageTransportHeaderSize + aeadTagSize // size of empty transport
@@ -217,7 +217,7 @@ type Handshake struct {
 	remoteIndex               uint32                   // index for sending
 	remoteStatic              NoisePublicKey           // long term key
 	remoteEphemeral           NoisePublicKey           // ephemeral public key
-	precomputedStaticStatic   [NoisePublicKeySize]byte // precomputed shared secret
+	precomputedStaticStatic   [NoiseSharedSecretSize]byte // precomputed shared secret
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
