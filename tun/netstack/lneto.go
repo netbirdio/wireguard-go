@@ -11,10 +11,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -78,6 +80,12 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 			}
 		}
 	}
+
+	// DNS transport: default to TCP (DNS over TCP) so large responses are not
+	// truncated; NB_LNETO_DNS_UDP forces the legacy UDP path. dnsServer is the
+	// IPv4-preferred server the TCP path dials directly.
+	dev.dnsServer = dnsServer
+	dev.dnsUDP = os.Getenv("NB_LNETO_DNS_UDP") != ""
 
 	var randSeed int64
 	if err := binary.Read(crand.Reader, binary.LittleEndian, &randSeed); err != nil {
@@ -180,7 +188,12 @@ type lnetoStack struct {
 
 	mtu          int
 	dnsServers   []netip.Addr
+	dnsServer    netip.Addr // IPv4-preferred server used by the TCP DNS path.
+	dnsUDP       bool       // when true resolve over UDP (legacy path) instead of TCP.
 	hasV4, hasV6 bool
+
+	// dnsScratch holds the reusable buffers for the DNS-over-TCP lookup path.
+	dnsScratch dnsScratch
 }
 
 type event struct{}
@@ -445,19 +458,17 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 			timeout = rem
 		}
 	}
-	blk := n.sa.StackBlocking(n.backoff)
-
 	var addrsV4, addrsV6 []netip.Addr
 	var lastErr error
 	if n.hasV4 {
-		if a, err := blk.DoLookupIPType(host, timeout, dns.TypeA); err != nil {
+		if a, err := n.lookupIPType(ctx, host, dns.TypeA, timeout); err != nil {
 			lastErr = dnsError(host, err)
 		} else {
 			addrsV4 = a
 		}
 	}
 	if n.hasV6 {
-		if a, err := blk.DoLookupIPType(host, timeout, dns.TypeAAAA); err != nil {
+		if a, err := n.lookupIPType(ctx, host, dns.TypeAAAA, timeout); err != nil {
 			if lastErr == nil {
 				lastErr = dnsError(host, err)
 			}
@@ -484,4 +495,140 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 		out[i] = a.String()
 	}
 	return out, nil
+}
+
+var errNoDNSServer = errors.New("no DNS server configured")
+
+// lookupIPType resolves host for a single record type, selecting the DNS transport:
+// TCP by default (see CreateNetTUNLneto) or the legacy UDP path when dnsUDP is set.
+func (n *lnetoStack) lookupIPType(ctx context.Context, host string, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+	if n.dnsUDP {
+		return n.sa.StackBlocking(n.backoff).DoLookupIPType(host, timeout, qtype)
+	}
+	return n.lookupTCP(ctx, host, qtype, timeout)
+}
+
+// lookupTCP performs a DNS query over TCP (RFC 1035 §4.2.2: each message is preceded
+// by a two-byte length field), dialing the configured DNS server on port 53 using the
+// lneto TCP socket. It mirrors the gvisor backend's dnsStreamRoundTrip but builds and
+// parses the message with lneto's dns package. IPv4 transport only, matching the UDP path.
+func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+	if !n.dnsServer.IsValid() {
+		return nil, errNoDNSServer
+	}
+
+	txid := uint16(n.sa.Prand32())
+
+	// The shared dnsScratch buffers are reused across the whole round trip
+	// (build → write → read → parse), so hold the lock for the entire function.
+	// This serializes DNS lookups, which is fine: A and AAAA already run sequentially.
+	s := &n.dnsScratch
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	framed, err := s.buildQuery(host, qtype, txid)
+	if err != nil {
+		return nil, err
+	}
+
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := n.dialTCPCtx(dialCtx, netip.AddrPortFrom(n.dnsServer, dns.ServerPort))
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if dl, ok := dialCtx.Deadline(); ok {
+		if err := conn.SetDeadline(dl); err != nil {
+			return nil, err
+		}
+	}
+
+	// Write the 2-byte length prefix followed by the message in a single write.
+	if _, err := conn.Write(framed); err != nil {
+		return nil, err
+	}
+
+	msg, err := s.readResponse(conn)
+	if err != nil {
+		return nil, err
+	}
+	return s.parseAnswers(msg, txid, host)
+}
+
+// dnsScratch holds reusable buffers for building and parsing DNS-over-TCP
+// messages, retaining slice backing arrays across lookups. Not safe for
+// concurrent use: callers must hold mu across an entire build→read→parse
+// sequence because buf is reused for both the query and the response.
+type dnsScratch struct {
+	mu    sync.Mutex
+	msg   dns.Message
+	buf   []byte         // length-prefixed wire buffer
+	addrs [16]netip.Addr // decode target
+}
+
+// buildQuery resets the scratch, encodes a single-question recursion-desired
+// query for host/qtype with txid, and returns the 2-byte-length-prefixed wire
+// bytes (aliases buf; valid until the next scratch use). Caller holds mu.
+func (s *dnsScratch) buildQuery(host string, qtype dns.Type, txid uint16) ([]byte, error) {
+	name, err := dns.NewName(host)
+	if err != nil {
+		return nil, err
+	}
+	// Layout: 2-byte length prefix followed by the message body.
+	s.msg.Reset()
+	s.msg.AddQuestions([]dns.Question{{Name: name, Type: qtype, Class: dns.ClassINET}})
+	msglen := s.msg.Len()
+	s.buf = slices.Grow(s.buf[:0], int(msglen)+2)[:2]
+	binary.BigEndian.PutUint16(s.buf[:2], msglen)
+	s.buf, err = s.msg.AppendTo(s.buf, txid, dns.NewClientHeaderFlags(dns.OpCodeQuery, true))
+	if err != nil {
+		return nil, err
+	}
+	return s.buf, nil
+}
+
+// readResponse reads a length-prefixed DNS response from r into buf and returns
+// the message bytes (aliases buf; valid until the next scratch use). Caller holds mu.
+func (s *dnsScratch) readResponse(r io.Reader) ([]byte, error) {
+	if _, err := io.ReadFull(r, s.buf[:2]); err != nil {
+		return nil, err
+	}
+	rlen := binary.BigEndian.Uint16(s.buf[:2])
+	s.buf = slices.Grow(s.buf[:0], int(rlen))[:rlen]
+	if _, err := io.ReadFull(r, s.buf); err != nil {
+		return nil, err
+	}
+	return s.buf, nil
+}
+
+// parseAnswers validates msg against txid (TxID, IsResponse, ResponseCode),
+// decodes it, and returns a freshly cloned slice of answer addresses for host.
+// Caller holds mu. Returns the DNS rcode as error when non-zero.
+func (s *dnsScratch) parseAnswers(msg []byte, txid uint16, host string) ([]netip.Addr, error) {
+	f, err := dns.NewFrame(msg)
+	if err != nil {
+		return nil, err
+	}
+	if f.TxID() != txid || !f.Flags().IsResponse() {
+		return nil, errInvalidDNSResponse
+	}
+	if rcode := f.Flags().ResponseCode(); rcode != 0 {
+		return nil, rcode
+	}
+	s.msg.Reset()
+	s.msg.LimitResourceDecoding(1, uint16(len(s.addrs)), 0, 4) // allow up to 16 answers to decode.
+	var nAns uint16
+	if _, incompleteButOK, derr := s.msg.Decode(msg); derr != nil && !incompleteButOK {
+		err = derr
+	} else {
+		nAns, err = s.msg.WriteAnswers(s.addrs[:], host)
+	}
+	if err != nil && err != lneto.ErrExhausted {
+		return nil, err
+	}
+	return slices.Clone(s.addrs[:nAns]), nil
 }
