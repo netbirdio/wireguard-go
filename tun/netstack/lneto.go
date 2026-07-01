@@ -11,10 +11,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -78,6 +80,12 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 			}
 		}
 	}
+
+	// DNS transport: default to TCP (DNS over TCP) so large responses are not
+	// truncated; NB_LNETO_DNS_UDP forces the legacy UDP path. dnsServer is the
+	// IPv4-preferred server the TCP path dials directly.
+	dev.dnsServer = dnsServer
+	dev.dnsUDP = os.Getenv("NB_LNETO_DNS_UDP") != ""
 
 	var randSeed int64
 	if err := binary.Read(crand.Reader, binary.LittleEndian, &randSeed); err != nil {
@@ -180,7 +188,16 @@ type lnetoStack struct {
 
 	mtu          int
 	dnsServers   []netip.Addr
+	dnsServer    netip.Addr // IPv4-preferred server used by the TCP DNS path.
+	dnsUDP       bool       // when true resolve over UDP (legacy path) instead of TCP.
 	hasV4, hasV6 bool
+
+	// msgaux is reused across DNS lookups to retain the message's slice backing
+	// arrays (see dns.Message.Reset). msgauxMu guards it: each user is a single
+	// self-contained critical section (build or decode) with no network I/O held.
+	msgauxMu sync.Mutex
+	msgaux   dns.Message
+	msgbuf   []byte
 }
 
 type event struct{}
@@ -445,19 +462,17 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 			timeout = rem
 		}
 	}
-	blk := n.sa.StackBlocking(n.backoff)
-
 	var addrsV4, addrsV6 []netip.Addr
 	var lastErr error
 	if n.hasV4 {
-		if a, err := blk.DoLookupIPType(host, timeout, dns.TypeA); err != nil {
+		if a, err := n.lookupIPType(ctx, host, dns.TypeA, timeout); err != nil {
 			lastErr = dnsError(host, err)
 		} else {
 			addrsV4 = a
 		}
 	}
 	if n.hasV6 {
-		if a, err := blk.DoLookupIPType(host, timeout, dns.TypeAAAA); err != nil {
+		if a, err := n.lookupIPType(ctx, host, dns.TypeAAAA, timeout); err != nil {
 			if lastErr == nil {
 				lastErr = dnsError(host, err)
 			}
@@ -484,4 +499,113 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 		out[i] = a.String()
 	}
 	return out, nil
+}
+
+var (
+	errNoDNSServer       = errors.New("no DNS server configured")
+	errDNSMessageTooLong = errors.New("DNS message exceeds TCP length prefix maximum")
+)
+
+// lookupIPType resolves host for a single record type, selecting the DNS transport:
+// TCP by default (see CreateNetTUNLneto) or the legacy UDP path when dnsUDP is set.
+func (n *lnetoStack) lookupIPType(ctx context.Context, host string, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+	if n.dnsUDP {
+		return n.sa.StackBlocking(n.backoff).DoLookupIPType(host, timeout, qtype)
+	}
+	return n.lookupTCP(ctx, host, qtype, timeout)
+}
+
+// lookupTCP performs a DNS query over TCP (RFC 1035 §4.2.2: each message is preceded
+// by a two-byte length field), dialing the configured DNS server on port 53 using the
+// lneto TCP socket. It mirrors the gvisor backend's dnsStreamRoundTrip but builds and
+// parses the message with lneto's dns package. IPv4 transport only, matching the UDP path.
+func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+	if !n.dnsServer.IsValid() {
+		return nil, errNoDNSServer
+	}
+	name, err := dns.NewName(host)
+	if err != nil {
+		return nil, err
+	}
+
+	var txbuf [2]byte
+	if _, err := crand.Read(txbuf[:]); err != nil {
+		return nil, err
+	}
+	txid := uint16(n.sa.Prand32())
+
+	// Build the query message: single question, recursion desired. Reuse msgaux
+	// (guarded) so its slice memory carries over between lookups.
+	n.msgauxMu.Lock()
+	defer n.msgauxMu.Unlock()
+	n.msgaux.Reset()
+	n.msgaux.AddQuestions([]dns.Question{{Name: name, Type: qtype, Class: dns.ClassINET}})
+	msglen := n.msgaux.Len()
+	n.msgbuf = slices.Grow(n.msgbuf[:0], int(msglen)+2)
+	binary.BigEndian.PutUint16(n.msgbuf[:2], msglen)
+	n.msgbuf, err = n.msgaux.AppendTo(n.msgbuf[2:2], txid, dns.NewClientHeaderFlags(dns.OpCodeQuery, true))
+	if err != nil {
+
+		return nil, err
+	}
+
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := n.dialTCPCtx(dialCtx, netip.AddrPortFrom(n.dnsServer, dns.ServerPort))
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if dl, ok := dialCtx.Deadline(); ok {
+		if err := conn.SetDeadline(dl); err != nil {
+			return nil, err
+		}
+	}
+
+	// Write the 2-byte length prefix followed by the message in a single write.
+	if _, err := conn.Write(n.msgbuf); err != nil {
+		return nil, err
+	}
+
+	// Read the length-prefixed response.
+	var lenbuf [2]byte
+	if _, err := io.ReadFull(conn, lenbuf[:]); err != nil {
+		return nil, err
+	}
+	rlen := binary.BigEndian.Uint16(lenbuf[:])
+	resp := make([]byte, rlen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+
+	// Validate the response header against our query.
+	f, err := dns.NewFrame(resp)
+	if err != nil {
+		return nil, err
+	}
+	if f.TxID() != txid || !f.Flags().IsResponse() {
+		return nil, errInvalidDNSResponse
+	}
+	if rcode := f.Flags().ResponseCode(); rcode != 0 {
+		return nil, rcode
+	}
+
+	dst := make([]netip.Addr, 16)
+	n.msgauxMu.Lock()
+	n.msgaux.Reset()
+	n.msgaux.LimitResourceDecoding(1, 16, 0, 4) // allow up to 16 answers to decode.
+	var nAns uint16
+	if _, incompleteButOK, derr := n.msgaux.Decode(resp); derr != nil && !incompleteButOK {
+		err = derr
+	} else {
+		nAns, err = n.msgaux.WriteAnswers(dst, host)
+	}
+	n.msgauxMu.Unlock()
+	if err != nil && err != lneto.ErrExhausted {
+		return nil, err
+	}
+	return dst[:nAns], nil
 }

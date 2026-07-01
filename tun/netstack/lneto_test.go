@@ -9,7 +9,9 @@ package netstack
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/soypat/lneto/dns"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -299,4 +302,116 @@ func testTCPEcho(t *testing.T, addrA, addrB string) {
 	if err := <-srvDone; err != nil {
 		t.Fatal("server:", err)
 	}
+}
+
+// TestNet2_DNSOverTCP wires two lneto stacks back-to-back and resolves a name over
+// TCP: netA (client) runs LookupContextHost with the default TCP transport; netB
+// hosts a minimal DNS-over-TCP responder on port 53 that answers with a fixed A
+// record. It exercises the new lookupTCP path end-to-end (dial, 2-byte length
+// framing per RFC 1035 §4.2.2, message build/parse via lneto's dns package).
+func TestNet2_DNSOverTCP(t *testing.T) {
+	const (
+		addrA = "10.0.0.1"
+		addrB = "10.0.0.2" // also the DNS server address for netA.
+		host  = "example.com"
+	)
+	wantIP := netip.MustParseAddr("1.2.3.4")
+
+	devA, netA, err := CreateNetTUNLneto(
+		[]netip.Addr{netip.MustParseAddr(addrA)},
+		[]netip.Addr{netip.MustParseAddr(addrB)}, // dnsServers → dnsServer = addrB.
+		1500,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Default transport must be TCP (not the legacy UDP path).
+	if stA := devA.(*lnetoStack); stA.dnsUDP {
+		t.Fatal("expected TCP DNS transport by default")
+	}
+	devB, netB, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr(addrB)}, nil, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-devA.Events()
+	<-devB.Events()
+
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go func() { defer pumps.Done(); pump(devA, devB) }()
+	go func() { defer pumps.Done(); pump(devB, devA) }()
+
+	ln, err := netB.ListenTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(addrB), dns.ServerPort))
+	if err != nil {
+		t.Fatal("listen dns:", err)
+	}
+	defer func() {
+		devA.Close()
+		devB.Close()
+		pumps.Wait()
+		ln.Close()
+	}()
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- serveDNSOverTCP(ln, host, wantIP) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := netA.LookupContextHost(ctx, host)
+	if err != nil {
+		t.Fatal("lookup:", err)
+	}
+	if len(addrs) != 1 || addrs[0] != wantIP.String() {
+		t.Fatalf("lookup result mismatch: want [%s] got %v", wantIP, addrs)
+	}
+	if err := <-srvDone; err != nil {
+		t.Fatal("dns server:", err)
+	}
+}
+
+// serveDNSOverTCP accepts one DNS-over-TCP connection, reads the length-prefixed
+// query, and replies with a single A record (host → ip). It mirrors what netbird's
+// TCP resolver does, minimally, so the client's lookupTCP path can be tested.
+func serveDNSOverTCP(ln TCPListener, host string, ip netip.Addr) error {
+	conn, err := ln.Accept()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	var lenbuf [2]byte
+	if _, err := io.ReadFull(conn, lenbuf[:]); err != nil {
+		return err
+	}
+	query := make([]byte, binary.BigEndian.Uint16(lenbuf[:]))
+	if _, err := io.ReadFull(conn, query); err != nil {
+		return err
+	}
+	f, err := dns.NewFrame(query)
+	if err != nil {
+		return err
+	}
+	txid := f.TxID()
+
+	name, err := dns.NewName(host)
+	if err != nil {
+		return err
+	}
+	var resp dns.Message
+	resp.Reset()
+	resp.AddQuestions([]dns.Question{{Name: name, Type: dns.TypeA, Class: dns.ClassINET}})
+	ip4 := ip.As4()
+	resp.Answers = append(resp.Answers, dns.NewResource(name, dns.TypeA, dns.ClassINET, 300, ip4[:]))
+	// Response header: QR=1 (response), RA=1 (recursion available), RCODE=0.
+	const respFlags dns.HeaderFlags = 1<<15 | 1<<7
+	msg, err := resp.AppendTo(nil, txid, respFlags)
+	if err != nil {
+		return err
+	}
+	framed := make([]byte, 2+len(msg))
+	binary.BigEndian.PutUint16(framed[:2], uint16(len(msg)))
+	copy(framed[2:], msg)
+	_, err = conn.Write(framed)
+	return err
 }
