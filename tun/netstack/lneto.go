@@ -192,13 +192,8 @@ type lnetoStack struct {
 	dnsUDP       bool       // when true resolve over UDP (legacy path) instead of TCP.
 	hasV4, hasV6 bool
 
-	// msgaux is reused across DNS lookups to retain the message's slice backing
-	// arrays (see dns.Message.Reset). msgauxMu guards it: each user is a single
-	// self-contained critical section (build or decode) with no network I/O held.
-	msgauxMu sync.Mutex
-	msgaux   dns.Message
-	msgbuf   []byte
-	addrbuf  [16]netip.Addr
+	// dnsScratch holds the reusable buffers for the DNS-over-TCP lookup path.
+	dnsScratch dnsScratch
 }
 
 type event struct{}
@@ -502,10 +497,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 	return out, nil
 }
 
-var (
-	errNoDNSServer       = errors.New("no DNS server configured")
-	errDNSMessageTooLong = errors.New("DNS message exceeds TCP length prefix maximum")
-)
+var errNoDNSServer = errors.New("no DNS server configured")
 
 // lookupIPType resolves host for a single record type, selecting the DNS transport:
 // TCP by default (see CreateNetTUNLneto) or the legacy UDP path when dnsUDP is set.
@@ -524,28 +516,17 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 	if !n.dnsServer.IsValid() {
 		return nil, errNoDNSServer
 	}
-	name, err := dns.NewName(host)
-	if err != nil {
-		return nil, err
-	}
 
 	txid := uint16(n.sa.Prand32())
 
-	// The shared msgaux/msgbuf/addrbuf scratch is used across the whole round trip
-	// (build → write → read → decode), so hold the lock for the entire function.
+	// The shared dnsScratch buffers are reused across the whole round trip
+	// (build → write → read → parse), so hold the lock for the entire function.
 	// This serializes DNS lookups, which is fine: A and AAAA already run sequentially.
-	n.msgauxMu.Lock()
-	defer n.msgauxMu.Unlock()
+	s := &n.dnsScratch
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// Build the query message: single question, recursion desired. Reuse msgaux/msgbuf
-	// so their slice memory carries over between lookups. Layout: 2-byte length prefix
-	// followed by the message body.
-	n.msgaux.Reset()
-	n.msgaux.AddQuestions([]dns.Question{{Name: name, Type: qtype, Class: dns.ClassINET}})
-	msglen := n.msgaux.Len()
-	n.msgbuf = slices.Grow(n.msgbuf[:0], int(msglen)+2)[:2]
-	binary.BigEndian.PutUint16(n.msgbuf[:2], msglen)
-	n.msgbuf, err = n.msgaux.AppendTo(n.msgbuf, txid, dns.NewClientHeaderFlags(dns.OpCodeQuery, true))
+	framed, err := s.buildQuery(host, qtype, txid)
 	if err != nil {
 		return nil, err
 	}
@@ -567,21 +548,67 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 	}
 
 	// Write the 2-byte length prefix followed by the message in a single write.
-	if _, err := conn.Write(n.msgbuf); err != nil {
+	if _, err := conn.Write(framed); err != nil {
 		return nil, err
 	}
 
-	// Read the length-prefixed response.
-	if _, err := io.ReadFull(conn, n.msgbuf[:2]); err != nil {
+	msg, err := s.readResponse(conn)
+	if err != nil {
 		return nil, err
 	}
-	rlen := binary.BigEndian.Uint16(n.msgbuf[:2])
-	n.msgbuf = slices.Grow(n.msgbuf[:0], int(rlen))[:rlen]
-	if _, err := io.ReadFull(conn, n.msgbuf); err != nil {
+	return s.parseAnswers(msg, txid, host)
+}
+
+// dnsScratch holds reusable buffers for building and parsing DNS-over-TCP
+// messages, retaining slice backing arrays across lookups. Not safe for
+// concurrent use: callers must hold mu across an entire build→read→parse
+// sequence because buf is reused for both the query and the response.
+type dnsScratch struct {
+	mu    sync.Mutex
+	msg   dns.Message
+	buf   []byte         // length-prefixed wire buffer
+	addrs [16]netip.Addr // decode target
+}
+
+// buildQuery resets the scratch, encodes a single-question recursion-desired
+// query for host/qtype with txid, and returns the 2-byte-length-prefixed wire
+// bytes (aliases buf; valid until the next scratch use). Caller holds mu.
+func (s *dnsScratch) buildQuery(host string, qtype dns.Type, txid uint16) ([]byte, error) {
+	name, err := dns.NewName(host)
+	if err != nil {
 		return nil, err
 	}
-	msg := n.msgbuf
-	// Validate the response header against our query.
+	// Layout: 2-byte length prefix followed by the message body.
+	s.msg.Reset()
+	s.msg.AddQuestions([]dns.Question{{Name: name, Type: qtype, Class: dns.ClassINET}})
+	msglen := s.msg.Len()
+	s.buf = slices.Grow(s.buf[:0], int(msglen)+2)[:2]
+	binary.BigEndian.PutUint16(s.buf[:2], msglen)
+	s.buf, err = s.msg.AppendTo(s.buf, txid, dns.NewClientHeaderFlags(dns.OpCodeQuery, true))
+	if err != nil {
+		return nil, err
+	}
+	return s.buf, nil
+}
+
+// readResponse reads a length-prefixed DNS response from r into buf and returns
+// the message bytes (aliases buf; valid until the next scratch use). Caller holds mu.
+func (s *dnsScratch) readResponse(r io.Reader) ([]byte, error) {
+	if _, err := io.ReadFull(r, s.buf[:2]); err != nil {
+		return nil, err
+	}
+	rlen := binary.BigEndian.Uint16(s.buf[:2])
+	s.buf = slices.Grow(s.buf[:0], int(rlen))[:rlen]
+	if _, err := io.ReadFull(r, s.buf); err != nil {
+		return nil, err
+	}
+	return s.buf, nil
+}
+
+// parseAnswers validates msg against txid (TxID, IsResponse, ResponseCode),
+// decodes it, and returns a freshly cloned slice of answer addresses for host.
+// Caller holds mu. Returns the DNS rcode as error when non-zero.
+func (s *dnsScratch) parseAnswers(msg []byte, txid uint16, host string) ([]netip.Addr, error) {
 	f, err := dns.NewFrame(msg)
 	if err != nil {
 		return nil, err
@@ -592,16 +619,16 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 	if rcode := f.Flags().ResponseCode(); rcode != 0 {
 		return nil, rcode
 	}
-	n.msgaux.Reset()
-	n.msgaux.LimitResourceDecoding(1, uint16(len(n.addrbuf)), 0, 4) // allow up to 16 answers to decode.
+	s.msg.Reset()
+	s.msg.LimitResourceDecoding(1, uint16(len(s.addrs)), 0, 4) // allow up to 16 answers to decode.
 	var nAns uint16
-	if _, incompleteButOK, derr := n.msgaux.Decode(msg); derr != nil && !incompleteButOK {
+	if _, incompleteButOK, derr := s.msg.Decode(msg); derr != nil && !incompleteButOK {
 		err = derr
 	} else {
-		nAns, err = n.msgaux.WriteAnswers(n.addrbuf[:], host)
+		nAns, err = s.msg.WriteAnswers(s.addrs[:], host)
 	}
 	if err != nil && err != lneto.ErrExhausted {
 		return nil, err
 	}
-	return slices.Clone(n.addrbuf[:nAns]), nil
+	return slices.Clone(s.addrs[:nAns]), nil
 }
