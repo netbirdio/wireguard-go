@@ -198,6 +198,7 @@ type lnetoStack struct {
 	msgauxMu sync.Mutex
 	msgaux   dns.Message
 	msgbuf   []byte
+	addrbuf  [16]netip.Addr
 }
 
 type event struct{}
@@ -528,24 +529,24 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 		return nil, err
 	}
 
-	var txbuf [2]byte
-	if _, err := crand.Read(txbuf[:]); err != nil {
-		return nil, err
-	}
 	txid := uint16(n.sa.Prand32())
 
-	// Build the query message: single question, recursion desired. Reuse msgaux
-	// (guarded) so its slice memory carries over between lookups.
+	// The shared msgaux/msgbuf/addrbuf scratch is used across the whole round trip
+	// (build → write → read → decode), so hold the lock for the entire function.
+	// This serializes DNS lookups, which is fine: A and AAAA already run sequentially.
 	n.msgauxMu.Lock()
 	defer n.msgauxMu.Unlock()
+
+	// Build the query message: single question, recursion desired. Reuse msgaux/msgbuf
+	// so their slice memory carries over between lookups. Layout: 2-byte length prefix
+	// followed by the message body.
 	n.msgaux.Reset()
 	n.msgaux.AddQuestions([]dns.Question{{Name: name, Type: qtype, Class: dns.ClassINET}})
 	msglen := n.msgaux.Len()
-	n.msgbuf = slices.Grow(n.msgbuf[:0], int(msglen)+2)
+	n.msgbuf = slices.Grow(n.msgbuf[:0], int(msglen)+2)[:2]
 	binary.BigEndian.PutUint16(n.msgbuf[:2], msglen)
-	n.msgbuf, err = n.msgaux.AppendTo(n.msgbuf[2:2], txid, dns.NewClientHeaderFlags(dns.OpCodeQuery, true))
+	n.msgbuf, err = n.msgaux.AppendTo(n.msgbuf, txid, dns.NewClientHeaderFlags(dns.OpCodeQuery, true))
 	if err != nil {
-
 		return nil, err
 	}
 
@@ -571,18 +572,17 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 	}
 
 	// Read the length-prefixed response.
-	var lenbuf [2]byte
-	if _, err := io.ReadFull(conn, lenbuf[:]); err != nil {
+	if _, err := io.ReadFull(conn, n.msgbuf[:2]); err != nil {
 		return nil, err
 	}
-	rlen := binary.BigEndian.Uint16(lenbuf[:])
-	resp := make([]byte, rlen)
-	if _, err := io.ReadFull(conn, resp); err != nil {
+	rlen := binary.BigEndian.Uint16(n.msgbuf[:2])
+	n.msgbuf = slices.Grow(n.msgbuf[:0], int(rlen))[:rlen]
+	if _, err := io.ReadFull(conn, n.msgbuf); err != nil {
 		return nil, err
 	}
-
+	msg := n.msgbuf
 	// Validate the response header against our query.
-	f, err := dns.NewFrame(resp)
+	f, err := dns.NewFrame(msg)
 	if err != nil {
 		return nil, err
 	}
@@ -592,20 +592,16 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 	if rcode := f.Flags().ResponseCode(); rcode != 0 {
 		return nil, rcode
 	}
-
-	dst := make([]netip.Addr, 16)
-	n.msgauxMu.Lock()
 	n.msgaux.Reset()
-	n.msgaux.LimitResourceDecoding(1, 16, 0, 4) // allow up to 16 answers to decode.
+	n.msgaux.LimitResourceDecoding(1, uint16(len(n.addrbuf)), 0, 4) // allow up to 16 answers to decode.
 	var nAns uint16
-	if _, incompleteButOK, derr := n.msgaux.Decode(resp); derr != nil && !incompleteButOK {
+	if _, incompleteButOK, derr := n.msgaux.Decode(msg); derr != nil && !incompleteButOK {
 		err = derr
 	} else {
-		nAns, err = n.msgaux.WriteAnswers(dst, host)
+		nAns, err = n.msgaux.WriteAnswers(n.addrbuf[:], host)
 	}
-	n.msgauxMu.Unlock()
 	if err != nil && err != lneto.ErrExhausted {
 		return nil, err
 	}
-	return dst[:nAns], nil
+	return slices.Clone(n.addrbuf[:nAns]), nil
 }
