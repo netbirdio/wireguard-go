@@ -12,14 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"os"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/soypat/lneto"
@@ -365,10 +363,10 @@ func (n *lnetoStack) socket(ctx context.Context, proto string, sotype int, laddr
 		fam = laddr
 	}
 	network := proto + "4"
-	family := syscall.AF_INET
+	family := xnet.AF_INET
 	if fam.Addr().Is6() {
 		network = proto + "6"
-		family = syscall.AF_INET6
+		family = xnet.AF_INET6
 	}
 	n.interrupt()
 	defer n.interrupt()
@@ -376,7 +374,7 @@ func (n *lnetoStack) socket(ctx context.Context, proto string, sotype int, laddr
 }
 
 func (n *lnetoStack) dialTCPCtx(ctx context.Context, addr netip.AddrPort) (TCPConn, error) {
-	v, err := n.socket(ctx, "tcp", syscall.SOCK_STREAM, netip.AddrPort{}, addr)
+	v, err := n.socket(ctx, "tcp", xnet.SOCK_STREAM, netip.AddrPort{}, addr)
 	return socketResult[TCPConn](v, err)
 }
 
@@ -391,19 +389,19 @@ func (n *lnetoStack) DialTCPAddrPort(addr netip.AddrPort) (TCPConn, error) {
 // --- TCP listener ---
 
 func (n *lnetoStack) ListenTCPAddrPort(addr netip.AddrPort) (TCPListener, error) {
-	v, err := n.socket(context.Background(), "tcp", syscall.SOCK_STREAM, addr, netip.AddrPort{})
+	v, err := n.socket(context.Background(), "tcp", xnet.SOCK_STREAM, addr, netip.AddrPort{})
 	return socketResult[TCPListener](v, err)
 }
 
 // --- UDP ---
 
 func (n *lnetoStack) ListenUDPAddrPort(laddr netip.AddrPort) (UDPConn, error) {
-	v, err := n.socket(context.Background(), "udp", syscall.SOCK_DGRAM, laddr, netip.AddrPort{})
+	v, err := n.socket(context.Background(), "udp", xnet.SOCK_DGRAM, laddr, netip.AddrPort{})
 	return socketResult[UDPConn](v, err)
 }
 
 func (n *lnetoStack) DialUDPAddrPort(laddr, raddr netip.AddrPort) (UDPConn, error) {
-	v, err := n.socket(context.Background(), "udp", syscall.SOCK_DGRAM, laddr, raddr)
+	v, err := n.socket(context.Background(), "udp", xnet.SOCK_DGRAM, laddr, raddr)
 	return socketResult[UDPConn](v, err)
 }
 
@@ -419,16 +417,6 @@ func (n *lnetoStack) ListenPingAddr(_ netip.Addr) (PingConn, error) {
 
 // --- DNS ---
 
-// dnsError wraps a lookup failure as a *net.DNSError, flagging timeouts when the
-// underlying error reports them. Mirrors the error shape produced by the gvisor Net.
-func dnsError(host string, err error) *net.DNSError {
-	de := &net.DNSError{Err: err.Error(), Name: host}
-	if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-		de.IsTimeout = true
-	}
-	return de
-}
-
 // LookupContextHost resolves host to a list of IP strings, matching the behaviour of
 // the gvisor Net: literal IPs (with IPv6 zone stripping) pass through; empty or
 // non-domain hosts and stacks with no address family return an IsNotFound DNSError;
@@ -436,7 +424,7 @@ func dnsError(host string, err error) *net.DNSError {
 // results are ordered first (no RFC 6724).
 func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]string, error) {
 	if host == "" || (!n.hasV4 && !n.hasV6) {
-		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
+		return nil, dnsError(host, "", errNoSuchHost, true)
 	}
 	// Strip any IPv6 zone before attempting to parse a literal address.
 	zlen := len(host)
@@ -449,7 +437,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 		return []string{ip.String()}, nil
 	}
 	if !isDomainName(host) {
-		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
+		return nil, dnsError(host, "", errNoSuchHost, true)
 	}
 
 	timeout := 5 * time.Second
@@ -462,7 +450,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 	var lastErr error
 	if n.hasV4 {
 		if a, err := n.lookupIPType(ctx, host, dns.TypeA, timeout); err != nil {
-			lastErr = dnsError(host, err)
+			lastErr = dnsError(host, "", err, false)
 		} else {
 			addrsV4 = a
 		}
@@ -470,7 +458,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 	if n.hasV6 {
 		if a, err := n.lookupIPType(ctx, host, dns.TypeAAAA, timeout); err != nil {
 			if lastErr == nil {
-				lastErr = dnsError(host, err)
+				lastErr = dnsError(host, "", err, false)
 			}
 		} else {
 			addrsV6 = a
@@ -488,7 +476,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 		if lastErr != nil {
 			return nil, lastErr
 		}
-		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
+		return nil, dnsError(host, "", errNoSuchHost, true)
 	}
 	out := make([]string, len(addrs))
 	for i, a := range addrs {
