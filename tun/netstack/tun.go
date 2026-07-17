@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -70,6 +71,15 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 	tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
+	}
+	if runtime.GOOS == "windows" {
+		// gVisor's RACK loss detection performs poorly on Windows: ACKs are not
+		// handled in a timely manner, leading to spurious retransmissions and a
+		// collapsed congestion window. Disable it to restore throughput.
+		recoveryOpt := tcpip.TCPRecovery(0)
+		if tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &recoveryOpt); tcpipErr != nil {
+			return nil, nil, fmt.Errorf("could not disable TCP RACK: %v", tcpipErr)
+		}
 	}
 	dev.notifyHandle = dev.ep.AddNotify(dev)
 	tcpipErr = dev.stack.CreateNIC(1, dev.ep)
