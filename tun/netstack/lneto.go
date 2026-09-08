@@ -202,8 +202,12 @@ type lnetoStack struct {
 	dnsUDP       bool       // when true resolve over UDP (legacy path) instead of TCP.
 	hasV4, hasV6 bool
 
-	// dnsScratch holds the reusable buffers for the DNS-over-TCP lookup path.
-	dnsScratch dnsScratch
+	// dnsPool recycles the *dnsScratch buffers used by the DNS-over-TCP lookup
+	// path. A pool rather than one shared scratch: lookupTCP needs its scratch
+	// for a whole round trip including the dial and the blocking read, and a
+	// mutex held that long would serialize concurrent lookups on a lock that
+	// cannot observe their contexts.
+	dnsPool sync.Pool
 }
 
 type event struct{}
@@ -519,12 +523,14 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 
 	txid := uint16(n.sa.Prand32())
 
-	// The shared dnsScratch buffers are reused across the whole round trip
-	// (build → write → read → parse), so hold the lock for the entire function.
-	// This serializes DNS lookups, which is fine: A and AAAA already run sequentially.
-	s := &n.dnsScratch
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// The scratch buffers are reused across the whole round trip (build → write →
+	// read → parse), so this call owns one exclusively until it returns. Taking it
+	// from the pool keeps that reuse without serializing concurrent lookups.
+	s, _ := n.dnsPool.Get().(*dnsScratch)
+	if s == nil {
+		s = new(dnsScratch)
+	}
+	defer n.dnsPool.Put(s)
 
 	framed, err := s.buildQuery(host, qtype, txid)
 	if err != nil {
@@ -561,10 +567,11 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type,
 
 // dnsScratch holds reusable buffers for building and parsing DNS-over-TCP
 // messages, retaining slice backing arrays across lookups. Not safe for
-// concurrent use: callers must hold mu across an entire build→read→parse
-// sequence because buf is reused for both the query and the response.
+// concurrent use: one lookup owns a scratch for an entire build→read→parse
+// sequence because buf is reused for both the query and the response. Scratches
+// are recycled through [lnetoStack.dnsPool], which is what makes that ownership
+// exclusive.
 type dnsScratch struct {
-	mu    sync.Mutex
 	msg   dns.Message
 	buf   []byte         // length-prefixed wire buffer
 	addrs [16]netip.Addr // decode target
@@ -572,7 +579,7 @@ type dnsScratch struct {
 
 // buildQuery resets the scratch, encodes a single-question recursion-desired
 // query for host/qtype with txid, and returns the 2-byte-length-prefixed wire
-// bytes (aliases buf; valid until the next scratch use). Caller holds mu.
+// bytes (aliases buf; valid until the next scratch use).
 func (s *dnsScratch) buildQuery(host string, qtype dns.Type, txid uint16) ([]byte, error) {
 	name, err := dns.NewName(host)
 	if err != nil {
@@ -592,7 +599,7 @@ func (s *dnsScratch) buildQuery(host string, qtype dns.Type, txid uint16) ([]byt
 }
 
 // readResponse reads a length-prefixed DNS response from r into buf and returns
-// the message bytes (aliases buf; valid until the next scratch use). Caller holds mu.
+// the message bytes (aliases buf; valid until the next scratch use).
 func (s *dnsScratch) readResponse(r io.Reader) ([]byte, error) {
 	if _, err := io.ReadFull(r, s.buf[:2]); err != nil {
 		return nil, err
@@ -607,7 +614,7 @@ func (s *dnsScratch) readResponse(r io.Reader) ([]byte, error) {
 
 // parseAnswers validates msg against txid (TxID, IsResponse, ResponseCode),
 // decodes it, and returns a freshly cloned slice of answer addresses for host.
-// Caller holds mu. Returns the DNS rcode as error when non-zero.
+// Returns the DNS rcode as error when non-zero.
 func (s *dnsScratch) parseAnswers(msg []byte, txid uint16, host string) ([]netip.Addr, error) {
 	f, err := dns.NewFrame(msg)
 	if err != nil {

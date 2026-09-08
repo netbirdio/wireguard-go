@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -369,14 +370,133 @@ func TestNet2_DNSOverTCP(t *testing.T) {
 	}
 }
 
-// serveDNSOverTCP accepts one DNS-over-TCP connection, reads the length-prefixed
-// query, and replies with a single A record (host → ip). It mirrors what netbird's
-// TCP resolver does, minimally, so the client's lookupTCP path can be tested.
+// TestNet2_DNSConcurrentLookups runs overlapping LookupContextHost calls against
+// one stack. The lookup path reuses scratch buffers across a whole round trip
+// (dial → write → read → parse); this covers that the buffers are checked out per
+// call rather than shared, so concurrent lookups neither corrupt each other's
+// message nor serialize behind a lock that cannot see their contexts.
+func TestNet2_DNSConcurrentLookups(t *testing.T) {
+	const (
+		addrA      = "10.0.0.1"
+		addrB      = "10.0.0.2" // also the DNS server address for netA.
+		host       = "example.com"
+		nLookups   = 8
+		perLookupT = 5 * time.Second
+	)
+	wantIP := netip.MustParseAddr("1.2.3.4")
+
+	devA, netA, err := CreateNetTUNLneto(
+		[]netip.Addr{netip.MustParseAddr(addrA)},
+		[]netip.Addr{netip.MustParseAddr(addrB)},
+		1500,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devB, netB, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr(addrB)}, nil, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-devA.Events()
+	<-devB.Events()
+
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go func() { defer pumps.Done(); pump(devA, devB) }()
+	go func() { defer pumps.Done(); pump(devB, devA) }()
+
+	ln, err := netB.ListenTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(addrB), dns.ServerPort))
+	if err != nil {
+		t.Fatal("listen dns:", err)
+	}
+	// The server takes exactly nLookups connections and then returns on its own.
+	// Stopping it by closing ln instead would have Close race the spin loop's
+	// unsynchronized closed check in lneto's tcplistener.
+	srvDone := make(chan struct{})
+	go func() { defer close(srvDone); serveDNSOverTCPN(ln, host, wantIP, nLookups) }()
+	// Teardown order matters: the listener shares stack state with the pumps' Read,
+	// so it is only closed once both devices are down and the pumps have stopped.
+	defer func() {
+		devA.Close()
+		devB.Close()
+		pumps.Wait()
+		ln.Close()
+	}()
+
+	// The server answers nothing until all nLookups connections are open, so these
+	// must genuinely overlap; a serialized client deadlocks and every lookup fails
+	// on its own deadline.
+	results := make([]error, nLookups)
+	var lookups sync.WaitGroup
+	lookups.Add(nLookups)
+	for i := range results {
+		go func() {
+			defer lookups.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), perLookupT)
+			defer cancel()
+			addrs, err := netA.LookupContextHost(ctx, host)
+			if err != nil {
+				results[i] = err
+				return
+			}
+			if len(addrs) != 1 || addrs[0] != wantIP.String() {
+				results[i] = fmt.Errorf("want [%s] got %v", wantIP, addrs)
+			}
+		}()
+	}
+	lookups.Wait()
+	select {
+	case <-srvDone:
+	case <-time.After(time.Second):
+		t.Error("dns server did not serve all lookups")
+	}
+	for i, err := range results {
+		if err != nil {
+			t.Errorf("lookup %d: %v", i, err)
+		}
+	}
+}
+
+// serveDNSOverTCP accepts one DNS-over-TCP connection and answers it.
 func serveDNSOverTCP(ln TCPListener, host string, ip netip.Addr) error {
 	conn, err := ln.Accept()
 	if err != nil {
 		return err
 	}
+	return handleDNSOverTCP(conn, host, ip)
+}
+
+// serveDNSOverTCPN accepts exactly n DNS-over-TCP connections and only then
+// answers them, in parallel. Holding every connection open until all n have
+// arrived is what makes it a concurrency check rather than a throughput one: if
+// the client serialized its lookups, the first would sit waiting for a response
+// that cannot come until the second connects, and every lookup would fail on its
+// own deadline. It returns without closing ln, so the caller never has to close
+// the listener out from under a blocked Accept.
+func serveDNSOverTCPN(ln TCPListener, host string, ip netip.Addr, n int) {
+	conns := make([]net.Conn, 0, n)
+	for range n {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conns = append(conns, conn)
+	}
+	var served sync.WaitGroup
+	served.Add(len(conns))
+	for _, conn := range conns {
+		go func() {
+			defer served.Done()
+			handleDNSOverTCP(conn, host, ip)
+		}()
+	}
+	served.Wait()
+}
+
+// handleDNSOverTCP reads one length-prefixed query off conn and replies with a
+// single A record (host → ip). It mirrors what netbird's TCP resolver does,
+// minimally, so the client's lookupTCP path can be tested.
+func handleDNSOverTCP(conn net.Conn, host string, ip netip.Addr) error {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
