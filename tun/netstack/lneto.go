@@ -22,6 +22,8 @@ import (
 
 	"github.com/soypat/lneto"
 	"github.com/soypat/lneto/dns"
+	"github.com/soypat/lneto/tcp"
+	"github.com/soypat/lneto/tcp/rto"
 	"github.com/soypat/lneto/x/xnet"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -142,12 +144,22 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 			EstablishedTimeout: 30 * time.Second,
 			ClosingTimeout:     10 * time.Second,
 			NewBackoff:         newTCPBackoff, // required: StackGo panics if nil.
+			NanoTime:           nanotime,
+			NewPolicy: func() tcp.Policy {
+				rto := new(rto.Timer)
+				rto.Configure(nanotime)
+				return rto
+			},
 		},
 		TCPDialTimeout: time.Second,
 		TCPDialRetries: 30,
 	})
 	dev.events <- tun.EventUp
 	return dev, &Net{stack: dev}, nil
+}
+
+func nanotime() int64 {
+	return time.Now().UnixNano()
 }
 
 // lnetoStack is a lneto-backed userspace network stack that implements both
