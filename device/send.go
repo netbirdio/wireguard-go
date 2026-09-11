@@ -66,6 +66,24 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	return elem
 }
 
+// TryNewOutboundElement is NewOutboundElement without the wait. It returns
+// false if either pool is at capacity, giving back whatever it already took.
+func (device *Device) TryNewOutboundElement() (*QueueOutboundElement, bool) {
+	elem, ok := device.TryGetOutboundElement()
+	if !ok {
+		return nil, false
+	}
+	buffer, ok := device.TryGetMessageBuffer()
+	if !ok {
+		device.PutOutboundElement(elem)
+		return nil, false
+	}
+	elem.buffer = buffer
+	elem.nonce = 0
+	// keypair and peer were cleared (if necessary) by clearPointers.
+	return elem, true
+}
+
 // clearPointers clears elem fields that contain pointers.
 // This makes the garbage collector's life easier and
 // avoids accidentally keeping other objects around unnecessarily.
@@ -81,23 +99,52 @@ func (elem *QueueOutboundElement) clearPointers() {
  */
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
-		elem := peer.device.NewOutboundElement()
-		elemsContainer := peer.device.GetOutboundElementsContainer()
-		elemsContainer.elems = append(elemsContainer.elems, elem)
-		select {
-		case peer.queue.staged <- elemsContainer:
-			peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
-		default:
-			peer.device.PutMessageBuffer(elem.buffer)
-			peer.device.PutOutboundElement(elem)
-			peer.device.PutOutboundElementsContainer(elemsContainer)
-		}
+		peer.stageKeepalive()
 	}
 	peer.SendStagedPackets()
 }
 
-func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
-	if !isRetry {
+// stageKeepalive queues one keepalive packet, or gives up if the buffer pool is
+// at capacity.
+//
+// Giving up matters: the keepalive timers call this from a timer callback, which
+// holds that timer's runningLock for the whole of the call. Timer.DelSync waits
+// on the same lock, so a callback parked in the pool blocks Peer.Stop, and with
+// it RemovePeer and Device.Close - the very operations that would return staged
+// buffers to the pool and let it drain. A keepalive is best effort, so dropping
+// one costs nothing and the next tick retries.
+func (peer *Peer) stageKeepalive() {
+	elem, ok := peer.device.TryNewOutboundElement()
+	if !ok {
+		peer.device.log.Verbosef("%v - Skipping keepalive, buffer pool exhausted", peer)
+		return
+	}
+	elemsContainer, ok := peer.device.TryGetOutboundElementsContainer()
+	if !ok {
+		peer.device.PutMessageBuffer(elem.buffer)
+		peer.device.PutOutboundElement(elem)
+		peer.device.log.Verbosef("%v - Skipping keepalive, buffer pool exhausted", peer)
+		return
+	}
+	elemsContainer.elems = append(elemsContainer.elems, elem)
+	select {
+	case peer.queue.staged <- elemsContainer:
+		peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
+	default:
+		peer.device.PutMessageBuffer(elem.buffer)
+		peer.device.PutOutboundElement(elem)
+		peer.device.PutOutboundElementsContainer(elemsContainer)
+	}
+}
+
+// SendHandshakeInitiation sends a handshake initiation, rate-limited to one per
+// RekeyTimeout. resetAttempts clears the failed-attempt counter that
+// expiredRetransmitHandshake reads to decide when to give up: pass true only
+// when there is evidence the peer is reachable - a live keypair, a completed
+// handshake, a peer whose timers just started - so the negotiation has earned
+// a fresh budget of attempts. Outbound traffic alone is not such evidence.
+func (peer *Peer) SendHandshakeInitiation(resetAttempts bool) error {
+	if resetAttempts {
 		peer.timers.handshakeAttempts.Store(0)
 	}
 
@@ -228,7 +275,7 @@ func (peer *Peer) keepKeyFreshSending() {
 	}
 	nonce := keypair.sendNonce.Load()
 	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
-		peer.SendHandshakeInitiation(false)
+		peer.SendHandshakeInitiation(true)
 	}
 }
 
@@ -371,6 +418,11 @@ top:
 
 	keypair := peer.keypairs.Current()
 	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+		// Do not reset the counter. Traffic for a peer with no usable keypair
+		// keeps arriving while the peer is down, and resetting on every packet
+		// keeps expiredRetransmitHandshake from ever reaching
+		// MaxTimerHandshakes - the point at which it gives up, flushes the
+		// staged queue and releases its buffers.
 		peer.SendHandshakeInitiation(false)
 		return
 	}
