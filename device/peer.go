@@ -48,9 +48,10 @@ type Peer struct {
 	}
 
 	queue struct {
-		staged   chan *QueueOutboundElementsContainer // staged packets before a handshake is available
-		outbound *autodrainingOutboundQueue           // sequential ordering of udp transmission
-		inbound  *autodrainingInboundQueue            // sequential ordering of tun writing
+		staged        chan *QueueOutboundElementsContainer // staged packets before a handshake is available
+		stagedPackets atomic.Int32                         // packets in staged, kept near MaxStagedPackets by StagePackets
+		outbound      *autodrainingOutboundQueue           // sequential ordering of udp transmission
+		inbound       *autodrainingInboundQueue            // sequential ordering of tun writing
 	}
 
 	cookieGenerator             CookieGenerator
