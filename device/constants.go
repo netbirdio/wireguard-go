@@ -37,4 +37,5 @@ const (
 const (
 	UnderLoadAfterTime = time.Second // how long does the device remain under load after detected
 	MaxPeers           = 1 << 16     // maximum number of configured peers
+	MaxStagedPackets   = 128         // packets a peer may hold while waiting for a handshake; the kernel's MAX_STAGED_PACKETS
 )

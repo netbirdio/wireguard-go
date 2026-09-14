@@ -134,29 +134,127 @@ func TestSendKeepaliveWithExhaustedPool(t *testing.T) {
 	}
 }
 
-// TestStagedSendKeepsHandshakeAttempts guards the other half of the same
-// failure: expiredRetransmitHandshake only gives up, and only then flushes the
-// staged queue, once handshakeAttempts reaches MaxTimerHandshakes. Traffic for a
-// peer that cannot handshake must not keep resetting that counter.
-func TestStagedSendKeepsHandshakeAttempts(t *testing.T) {
-	dev, peer := newCappedDevice(t, 64)
+// poolInUse reports how many buffers are checked out of a capped pool.
+func poolInUse(p *WaitPool) uint32 {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	return p.count
+}
 
-	elem, ok := dev.TryNewOutboundElement()
-	if !ok {
-		t.Fatal("pool exhausted before the test started")
-	}
+// stageBatch takes perBatch elements from the pools and stages them on peer.
+func stageBatch(t *testing.T, dev *Device, peer *Peer, perBatch int) {
+	t.Helper()
+
 	container, ok := dev.TryGetOutboundElementsContainer()
 	if !ok {
-		t.Fatal("pool exhausted before the test started")
+		t.Fatal("container pool exhausted before the test started")
 	}
-	container.elems = append(container.elems, elem)
-	peer.queue.staged <- container
+	for i := 0; i < perBatch; i++ {
+		elem, ok := dev.TryNewOutboundElement()
+		if !ok {
+			t.Fatal("buffer pool exhausted before the test started")
+		}
+		container.elems = append(container.elems, elem)
+	}
+	peer.StagePackets(container)
+}
+
+// TestStagedSendResetsHandshakeAttempts pins the upstream and kernel rule that a
+// new outbound packet starts a fresh handshake budget. Recovering the buffers a
+// dead peer holds is StagePackets' job (see TestStagePacketsBoundedPerPeer), not
+// a reason to change the retry policy.
+func TestStagedSendResetsHandshakeAttempts(t *testing.T) {
+	dev, peer := newCappedDevice(t, 64)
+	stageBatch(t, dev, peer, 1)
 
 	peer.timers.handshakeAttempts.Store(3)
 	peer.SendStagedPackets()
 
-	if got := peer.timers.handshakeAttempts.Load(); got != 3 {
-		t.Fatalf("handshakeAttempts = %d, want 3: the data path must not reset the give-up counter", got)
+	if got := peer.timers.handshakeAttempts.Load(); got != 0 {
+		t.Fatalf("handshakeAttempts = %d, want 0: outbound traffic must reset the counter as upstream does", got)
+	}
+}
+
+// TestStagePacketsBoundedPerPeer checks the kernel's MAX_STAGED_PACKETS rule: a
+// peer with no session keeps at most MaxStagedPackets packets plus the batch
+// that pushed it over, whatever the batch size, and the batches it drops go
+// straight back to the pool.
+func TestStagePacketsBoundedPerPeer(t *testing.T) {
+	dev, peer := newCappedDevice(t, 4096)
+	peer.FlushStagedPackets()
+
+	const batches, perBatch = 40, 16
+	before := poolInUse(dev.pool.messageBuffers)
+	for b := 0; b < batches; b++ {
+		stageBatch(t, dev, peer, perBatch)
+	}
+
+	pinned := poolInUse(dev.pool.messageBuffers) - before
+	if pinned > MaxStagedPackets+perBatch {
+		t.Fatalf("staged queue pins %d buffers, want at most %d", pinned, MaxStagedPackets+perBatch)
+	}
+	if pinned < MaxStagedPackets {
+		t.Fatalf("staged queue pins %d buffers, want at least %d: the bound must not drop more than needed", pinned, MaxStagedPackets)
+	}
+	if got := peer.queue.stagedPackets.Load(); got < 0 || uint32(got) != pinned {
+		t.Fatalf("stagedPackets = %d, want %d: the counter must track the pool", got, pinned)
+	}
+
+	peer.FlushStagedPackets()
+	if after := poolInUse(dev.pool.messageBuffers); after != before {
+		t.Fatalf("%d buffers out after flush, want %d: staged buffers must return to the pool", after, before)
+	}
+	if got := peer.queue.stagedPackets.Load(); got != 0 {
+		t.Fatalf("stagedPackets = %d after flush, want 0", got)
+	}
+}
+
+// TestSendKeepaliveWithFullOutboundQueue covers the other place a keepalive
+// callback could park: handing its batch to the sequential sender. The sender
+// is wedged on a batch whose encryption never finishes, the queue behind it is
+// filled, and SendKeepalive must still return.
+func TestSendKeepaliveWithFullOutboundQueue(t *testing.T) {
+	pair := genTestPair(t, false)
+	pair.Send(t, Ping, nil)
+	pair.Send(t, Pong, nil)
+
+	dev := pair[0].dev
+	peer := dev.LookupPeer(onlyPeerKey(t, dev))
+
+	// Every container is locked, as a batch awaiting encryption would be, so
+	// the sender blocks on the first and the rest fill the queue. Unlocking
+	// them on the way out lets the sender drain before the device closes.
+	held := make([]*QueueOutboundElementsContainer, 0, QueueOutboundSize+1)
+	t.Cleanup(func() {
+		for _, c := range held {
+			c.Unlock()
+		}
+	})
+	for full := false; !full; {
+		c := dev.GetOutboundElementsContainer()
+		c.Lock()
+		select {
+		case peer.queue.outbound.c <- c:
+			held = append(held, c)
+		default:
+			c.Unlock()
+			dev.PutOutboundElementsContainer(c)
+			full = true
+		}
+	}
+
+	peer.FlushStagedPackets()
+
+	done := make(chan struct{})
+	go func() {
+		peer.SendKeepalive()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SendKeepalive blocked on a full outbound queue")
 	}
 }
 
