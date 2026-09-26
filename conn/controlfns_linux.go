@@ -86,31 +86,28 @@ func init() {
 			}
 			return err
 		},
-
-		// Attempt to enable UDP_GRO
-		func(network, address string, c syscall.RawConn) error {
-			// Kernels below 5.12 are missing 98184612aca0 ("net:
-			// udp: Add support for getsockopt(..., ..., UDP_GRO,
-			// ..., ...);"), which means we can't read this back
-			// later. We could pipe the return value through to
-			// the rest of the code, but UDP_GRO is kind of buggy
-			// anyway, so just gate this here.
-			major, minor := kernelVersion()
-			if major < 5 || (major == 5 && minor < 12) {
-				return nil
-			}
-
-			// Reads smaller than IdealBatchSize cannot split a coalesced
-			// datagram, and turning GRO off later would leave any datagram
-			// coalesced in the meantime to be read as one; see rxOffloadFor.
-			if batchSizeOverrideBelowIdeal() {
-				return nil
-			}
-
-			c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
-			})
-			return nil
-		},
 	)
+}
+
+// enableUDPGRO is the control function that attempts to enable UDP_GRO. The
+// bind applies it only to a socket that will be read in full batches, since a
+// smaller read cannot split a coalesced datagram, and it has to happen before
+// bind: turning GRO off later would leave whatever was coalesced in the
+// meantime to be read as one datagram.
+func enableUDPGRO(network, address string, c syscall.RawConn) error {
+	// Kernels below 5.12 are missing 98184612aca0 ("net:
+	// udp: Add support for getsockopt(..., ..., UDP_GRO,
+	// ..., ...);"), which means we can't read this back
+	// later. We could pipe the return value through to
+	// the rest of the code, but UDP_GRO is kind of buggy
+	// anyway, so just gate this here.
+	major, minor := kernelVersion()
+	if major < 5 || (major == 5 && minor < 12) {
+		return nil
+	}
+
+	c.Control(func(fd uintptr) {
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
+	})
+	return nil
 }

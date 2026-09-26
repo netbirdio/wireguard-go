@@ -47,12 +47,27 @@ func openIPv4(t *testing.T, bind *StdNetBind) *StdNetBind {
 	return bind
 }
 
-// skipWithoutGRO skips the test on a kernel where a plain socket does not come
-// up with UDP GRO, since there is nothing to turn off.
+// skipWithoutGRO skips the test on a kernel that refuses UDP GRO on a socket
+// of its own, probed without the bind, so a bind that fails to enable it is a
+// failure rather than a skip.
 func skipWithoutGRO(t *testing.T) {
 	t.Helper()
-	if !udpGROEnabled(t, openIPv4(t, NewStdNetBind().(*StdNetBind)).ipv4) {
-		t.Skip("this kernel does not enable UDP GRO")
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		t.Skip("no IPv4 socket")
+	}
+	defer conn.Close()
+	rc, err := conn.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Control(func(fd uintptr) {
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !udpGROEnabled(t, conn) {
+		t.Skip("this kernel does not support UDP GRO")
 	}
 }
 
@@ -92,11 +107,39 @@ func TestStdNetBindOpensWithoutGROForSmallRecvBatch(t *testing.T) {
 	if bind.ipv4RxOffload {
 		t.Fatal("rxOffload reported for a socket opened without GRO")
 	}
+	if bind.ipv6 != nil {
+		if udpGROEnabled(t, bind.ipv6) {
+			t.Fatal("UDP GRO is on for the IPv6 socket opened for a receive batch of 1")
+		}
+		if bind.ipv6RxOffload {
+			t.Fatal("rxOffload reported for the IPv6 socket opened without GRO")
+		}
+	}
 
 	full := NewStdNetBind().(*StdNetBind)
 	full.SetRecvBatchSize(IdealBatchSize)
 	openIPv4(t, full)
 	if !udpGROEnabled(t, full.ipv4) {
 		t.Fatal("UDP GRO is off for a socket opened for a full batch")
+	}
+	if !full.ipv4RxOffload {
+		t.Fatal("rxOffload not reported for a socket opened with GRO")
+	}
+}
+
+// TestStdNetBindOpensWithGROByDefault is the control for the two above: a bind
+// that was told nothing, under no override, still gets GRO at socket creation.
+func TestStdNetBindOpensWithGROByDefault(t *testing.T) {
+	skipWithoutGRO(t)
+
+	bind := openIPv4(t, NewStdNetBind().(*StdNetBind))
+	if !udpGROEnabled(t, bind.ipv4) {
+		t.Fatal("UDP GRO is off for a plain socket")
+	}
+	if !bind.ipv4RxOffload {
+		t.Fatal("rxOffload not reported for a plain socket with GRO")
+	}
+	if bind.ipv6 != nil && !udpGROEnabled(t, bind.ipv6) {
+		t.Fatal("UDP GRO is off for a plain IPv6 socket")
 	}
 }

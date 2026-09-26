@@ -55,8 +55,8 @@ type StdNetBind struct {
 }
 
 // SetRecvBatchSize tells the bind how many buffers the Device hands each
-// receive call. A socket opened for a batch below IdealBatchSize comes up
-// without GRO, since such reads cannot split a coalesced datagram and GRO
+// receive call. A socket opened for a batch below IdealBatchSize never has
+// GRO enabled, since such reads cannot split a coalesced datagram and GRO
 // cannot be turned off later without losing whatever was coalesced in the
 // meantime. Zero means IdealBatchSize.
 func (s *StdNetBind) SetRecvBatchSize(n int) {
@@ -65,19 +65,14 @@ func (s *StdNetBind) SetRecvBatchSize(n int) {
 	s.recvBatch = n
 }
 
-// recvBatchBelowIdeal is called with mu held.
-func (s *StdNetBind) recvBatchBelowIdeal() bool {
-	return s.recvBatch > 0 && s.recvBatch < IdealBatchSize
-}
-
-// openWithoutGRO turns GRO off on a socket that was just opened for a Device
-// reading small batches, and reports the rxOffload value to use for it. The
-// socket has been bound for microseconds at this point, so nothing has been
-// coalesced yet in practice. Should the switch fail, reading one datagram per
-// slot is still the only read that fits the buffers.
-func openWithoutGRO(conn *net.UDPConn) bool {
-	_ = disableUDPGRO(conn)
-	return false
+// wantGRO reports whether the sockets opened next may use GRO: only when
+// neither the bind's own batch size nor the package-level override is below
+// IdealBatchSize. Called with mu held.
+func (s *StdNetBind) wantGRO() bool {
+	if s.recvBatch > 0 && s.recvBatch < IdealBatchSize {
+		return false
+	}
+	return !batchSizeOverrideBelowIdeal()
 }
 
 func NewStdNetBindWithReceiverCreator(receiverCreator ReceiverCreator) *StdNetBind {
@@ -157,8 +152,14 @@ func (e *StdNetEndpoint) DstToString() string {
 	return e.AddrPort.String()
 }
 
-func listenNet(network string, port int) (*net.UDPConn, int, error) {
-	conn, err := listenConfig().ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
+// listenNet opens a socket for network on port, enabling GRO before bind when
+// gro is set.
+func listenNet(network string, port int, gro bool) (*net.UDPConn, int, error) {
+	var extra []controlFn
+	if gro {
+		extra = append(extra, enableUDPGRO)
+	}
+	conn, err := listenConfig(extra...).ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -193,14 +194,15 @@ again:
 	var v4conn, v6conn *net.UDPConn
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
+	gro := s.wantGRO()
 
-	v4conn, port, err = listenNet("udp4", port)
+	v4conn, port, err = listenNet("udp4", port, gro)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
 		return nil, 0, err
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet("udp6", port)
+	v6conn, port, err = listenNet("udp6", port, gro)
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		v4conn.Close()
 		tries++
@@ -213,9 +215,6 @@ again:
 	var fns []ReceiveFunc
 	if v4conn != nil {
 		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
-		if s.ipv4RxOffload && s.recvBatchBelowIdeal() {
-			s.ipv4RxOffload = openWithoutGRO(v4conn)
-		}
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
@@ -229,9 +228,6 @@ again:
 	}
 	if v6conn != nil {
 		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
-		if s.ipv6RxOffload && s.recvBatchBelowIdeal() {
-			s.ipv6RxOffload = openWithoutGRO(v6conn)
-		}
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc

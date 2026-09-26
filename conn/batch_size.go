@@ -19,7 +19,8 @@ func SetMaxBatchSizeOverride(n uint32) {
 }
 
 // batchSizeOverrideBelowIdeal reports whether Devices read batches smaller
-// than IdealBatchSize, in which case sockets are opened without GRO.
+// than IdealBatchSize, in which case sockets are opened without GRO. It
+// covers a bind opened before the Device could hand it a batch size.
 func batchSizeOverrideBelowIdeal() bool {
 	return MaxBatchSizeOverride > 0 && MaxBatchSizeOverride < IdealBatchSize
 }

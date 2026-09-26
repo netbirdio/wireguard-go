@@ -8,10 +8,17 @@
 
 package conn
 
-import "net"
+import (
+	"net"
+	"syscall"
+)
 
 func supportsUDPOffload(_ *net.UDPConn) (txOffload, rxOffload bool) {
 	return
+}
+
+func enableUDPGRO(_, _ string, _ syscall.RawConn) error {
+	return nil
 }
 
 func disableUDPGRO(_ *net.UDPConn) error {
