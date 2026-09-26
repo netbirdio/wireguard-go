@@ -23,3 +23,10 @@ func SetMaxBatchSizeOverride(n uint32) {
 func batchSizeOverrideBelowIdeal() bool {
 	return MaxBatchSizeOverride > 0 && MaxBatchSizeOverride < IdealBatchSize
 }
+
+// RecvBatchSizer is implemented by binds that open their sockets differently
+// for a Device reading batches smaller than IdealBatchSize. The Device calls
+// SetRecvBatchSize with its batch size before Open.
+type RecvBatchSizer interface {
+	SetRecvBatchSize(n int)
+}

@@ -33,9 +33,10 @@ func udpGROEnabled(t *testing.T, conn *net.UDPConn) bool {
 	return enabled
 }
 
-func openIPv4Bind(t *testing.T) *StdNetBind {
+// openIPv4 opens bind on an ephemeral port and returns it, skipping the test
+// when the host has no IPv4 socket to look at.
+func openIPv4(t *testing.T, bind *StdNetBind) *StdNetBind {
 	t.Helper()
-	bind := NewStdNetBind().(*StdNetBind)
 	if _, _, err := bind.Open(0); err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +47,15 @@ func openIPv4Bind(t *testing.T) *StdNetBind {
 	return bind
 }
 
+// skipWithoutGRO skips the test on a kernel where a plain socket does not come
+// up with UDP GRO, since there is nothing to turn off.
+func skipWithoutGRO(t *testing.T) {
+	t.Helper()
+	if !udpGROEnabled(t, openIPv4(t, NewStdNetBind().(*StdNetBind)).ipv4) {
+		t.Skip("this kernel does not enable UDP GRO")
+	}
+}
+
 // TestStdNetBindOpensWithoutGROUnderBatchOverride: a Device under a batch size
 // override below IdealBatchSize reads one message per buffer and cannot split
 // a coalesced datagram, so its sockets must come up without GRO. Turning it
@@ -54,18 +64,39 @@ func openIPv4Bind(t *testing.T) *StdNetBind {
 func TestStdNetBindOpensWithoutGROUnderBatchOverride(t *testing.T) {
 	prev := MaxBatchSizeOverride
 	t.Cleanup(func() { SetMaxBatchSizeOverride(prev) })
-
 	SetMaxBatchSizeOverride(0)
-	if !udpGROEnabled(t, openIPv4Bind(t).ipv4) {
-		t.Skip("this kernel does not enable UDP GRO")
-	}
+	skipWithoutGRO(t)
 
 	SetMaxBatchSizeOverride(1)
-	bind := openIPv4Bind(t)
+	bind := openIPv4(t, NewStdNetBind().(*StdNetBind))
 	if udpGROEnabled(t, bind.ipv4) {
 		t.Fatal("UDP GRO is on for a socket opened under a batch size override below IdealBatchSize")
 	}
 	if bind.ipv4RxOffload {
 		t.Fatal("rxOffload reported for a socket opened without GRO")
+	}
+}
+
+// TestStdNetBindOpensWithoutGROForSmallRecvBatch covers the batch size a
+// Device hands the bind before Open, which is how a per-instance override
+// reaches the socket.
+func TestStdNetBindOpensWithoutGROForSmallRecvBatch(t *testing.T) {
+	skipWithoutGRO(t)
+
+	bind := NewStdNetBind().(*StdNetBind)
+	bind.SetRecvBatchSize(1)
+	openIPv4(t, bind)
+	if udpGROEnabled(t, bind.ipv4) {
+		t.Fatal("UDP GRO is on for a socket opened for a receive batch of 1")
+	}
+	if bind.ipv4RxOffload {
+		t.Fatal("rxOffload reported for a socket opened without GRO")
+	}
+
+	full := NewStdNetBind().(*StdNetBind)
+	full.SetRecvBatchSize(IdealBatchSize)
+	openIPv4(t, full)
+	if !udpGROEnabled(t, full.ipv4) {
+		t.Fatal("UDP GRO is off for a socket opened for a full batch")
 	}
 }

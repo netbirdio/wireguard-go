@@ -523,6 +523,12 @@ func (device *Device) BindUpdate() error {
 	var recvFns []conn.ReceiveFunc
 	netc := &device.net
 
+	// A bind that opens its sockets differently for small batches needs the
+	// batch size before Open; see conn.StdNetBind.SetRecvBatchSize.
+	if b, ok := netc.bind.(conn.RecvBatchSizer); ok {
+		b.SetRecvBatchSize(device.BatchSize())
+	}
+
 	recvFns, netc.port, err = netc.bind.Open(netc.port)
 	if err != nil {
 		netc.port = 0

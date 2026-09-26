@@ -47,7 +47,37 @@ type StdNetBind struct {
 	blackhole4 bool
 	blackhole6 bool
 
+	// recvBatch is how many buffers the Device hands each receive call, set
+	// through SetRecvBatchSize before Open; zero means IdealBatchSize.
+	recvBatch int
+
 	receiverCreator ReceiverCreator
+}
+
+// SetRecvBatchSize tells the bind how many buffers the Device hands each
+// receive call. A socket opened for a batch below IdealBatchSize comes up
+// without GRO, since such reads cannot split a coalesced datagram and GRO
+// cannot be turned off later without losing whatever was coalesced in the
+// meantime. Zero means IdealBatchSize.
+func (s *StdNetBind) SetRecvBatchSize(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recvBatch = n
+}
+
+// recvBatchBelowIdeal is called with mu held.
+func (s *StdNetBind) recvBatchBelowIdeal() bool {
+	return s.recvBatch > 0 && s.recvBatch < IdealBatchSize
+}
+
+// openWithoutGRO turns GRO off on a socket that was just opened for a Device
+// reading small batches, and reports the rxOffload value to use for it. The
+// socket has been bound for microseconds at this point, so nothing has been
+// coalesced yet in practice. Should the switch fail, reading one datagram per
+// slot is still the only read that fits the buffers.
+func openWithoutGRO(conn *net.UDPConn) bool {
+	_ = disableUDPGRO(conn)
+	return false
 }
 
 func NewStdNetBindWithReceiverCreator(receiverCreator ReceiverCreator) *StdNetBind {
@@ -183,6 +213,9 @@ again:
 	var fns []ReceiveFunc
 	if v4conn != nil {
 		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
+		if s.ipv4RxOffload && s.recvBatchBelowIdeal() {
+			s.ipv4RxOffload = openWithoutGRO(v4conn)
+		}
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
@@ -196,6 +229,9 @@ again:
 	}
 	if v6conn != nil {
 		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
+		if s.ipv6RxOffload && s.recvBatchBelowIdeal() {
+			s.ipv6RxOffload = openWithoutGRO(v6conn)
+		}
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
@@ -297,13 +333,14 @@ func (s *StdNetBind) receiveIP(
 // GRO. A coalesced read uses the tail of a full IdealBatchSize message array
 // as scratch space and needs up to udpSegmentMaxDatagrams buffers per message.
 // A caller reading smaller batches provides neither: its datagrams would land
-// in message slots that carry no buffer and be truncated to nothing. A socket
-// opened under MaxBatchSizeOverride never has GRO on, so this only concerns a
-// Device with a per-instance override: GRO is turned off on the socket the
-// first time such a batch shows up, so the kernel delivers one datagram per
-// message from then on, at the cost of whatever it coalesced before that read,
-// which arrives as one datagram. Should the switch fail, reading one datagram
-// per slot is still the only read that fits the buffers.
+// in message slots that carry no buffer and be truncated to nothing. A Device
+// hands the bind its batch size before Open, so a socket read in small batches
+// never has GRO on; this only concerns a receive function driven without that
+// call. GRO is then turned off on the socket the first time such a batch shows
+// up, so the kernel delivers one datagram per message from then on, at the cost
+// of whatever it coalesced before that read, which arrives as one datagram.
+// Should the switch fail, reading one datagram per slot is still the only read
+// that fits the buffers.
 func rxOffloadFor(conn *net.UDPConn, rxOffload bool, batch int) bool {
 	if !rxOffload || batch >= IdealBatchSize {
 		return rxOffload
