@@ -11,6 +11,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/conn/bindtest"
+	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 )
 
@@ -25,6 +26,17 @@ func (b *recordingBind) SetRecvBatchSize(n int) {
 	b.recvBatch = n
 }
 
+// quietTUN is a channel TUN that never reports EventUp, so the Device only
+// comes up when the test says so and the batch size can be set first.
+type quietTUN struct {
+	tun.Device
+	events chan tun.Event
+}
+
+func (q *quietTUN) Events() <-chan tun.Event {
+	return q.events
+}
+
 // TestBindUpdateHandsTheBindItsBatchSize: a bind that opens its sockets
 // differently for small batches has to learn the Device's batch size before
 // Open, and a per-instance override must reach it the same way as the global
@@ -32,8 +44,12 @@ func (b *recordingBind) SetRecvBatchSize(n int) {
 func TestBindUpdateHandsTheBindItsBatchSize(t *testing.T) {
 	binds := bindtest.NewChannelBinds()
 	bind := &recordingBind{Bind: binds[0]}
-	dev := NewDevice(tuntest.NewChannelTUN().TUN(), bind, NewLogger(LogLevelError, "batch: "))
-	t.Cleanup(dev.Close)
+	tunDev := &quietTUN{Device: tuntest.NewChannelTUN().TUN(), events: make(chan tun.Event)}
+	dev := NewDevice(tunDev, bind, NewLogger(LogLevelError, "batch: "))
+	t.Cleanup(func() {
+		dev.Close()
+		close(tunDev.events)
+	})
 
 	sk, err := newPrivateKey()
 	if err != nil {
