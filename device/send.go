@@ -69,19 +69,55 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
 // TryNewOutboundElement is NewOutboundElement without the wait. It returns
 // false if either pool is at capacity, giving back whatever it already took.
 func (device *Device) TryNewOutboundElement() (*QueueOutboundElement, bool) {
+	return device.tryNewOutboundElement(false)
+}
+
+// tryNewOutboundElement is TryNewOutboundElement that, with reserveHalf set,
+// also gives up once half of the message buffers are in use; see
+// WaitPool.TryGetReservingHalf.
+func (device *Device) tryNewOutboundElement(reserveHalf bool) (*QueueOutboundElement, bool) {
 	elem, ok := device.TryGetOutboundElement()
 	if !ok {
 		return nil, false
 	}
-	buffer, ok := device.TryGetMessageBuffer()
+	var buffer any
+	if reserveHalf {
+		buffer, ok = device.pool.messageBuffers.TryGetReservingHalf()
+	} else {
+		buffer, ok = device.pool.messageBuffers.TryGet()
+	}
 	if !ok {
 		device.PutOutboundElement(elem)
 		return nil, false
 	}
-	elem.buffer = buffer
+	elem.buffer = buffer.(*[MaxMessageSize]byte)
 	elem.nonce = 0
 	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem, true
+}
+
+// dropOnExhaustedPool accounts for a packet the TUN reader found no buffer for.
+// Waiting in Get instead stops every peer on the Device and, because Peer.Stop
+// and Device.Close wait for the reader, peer removal and close with it; the
+// kernel drops when allocation fails, and so does this. A peer still without a
+// session gets its handshake kicked the way a staged packet would have, so it
+// can come up and the sender's retransmission gets through.
+func (device *Device) dropOnExhaustedPool(peer *Peer) {
+	device.pool.drops.Add(1)
+	if peer.isRunning.Load() && !peer.canSendNow() {
+		_ = peer.SendHandshakeInitiation(false)
+	}
+}
+
+// canSendNow reports whether the peer holds a keypair that can still encrypt.
+// Without one, outbound packets are staged behind a handshake that may never
+// complete.
+func (peer *Peer) canSendNow() bool {
+	return keypairCanSend(peer.keypairs.Current())
+}
+
+func keypairCanSend(keypair *Keypair) bool {
+	return keypair != nil && keypair.sendNonce.Load() < RejectAfterMessages && time.Since(keypair.created) < RejectAfterTime
 }
 
 // outboundElementsContainer is GetOutboundElementsContainer when wait is true;
@@ -368,14 +404,25 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer == nil {
 				continue
 			}
+			replacement, ok := device.tryNewOutboundElement(!peer.canSendNow())
+			if !ok {
+				device.dropOnExhaustedPool(peer)
+				continue
+			}
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
-				elemsForPeer = device.GetOutboundElementsContainer()
+				elemsForPeer, ok = device.TryGetOutboundElementsContainer()
+				if !ok {
+					device.PutMessageBuffer(replacement.buffer)
+					device.PutOutboundElement(replacement)
+					device.dropOnExhaustedPool(peer)
+					continue
+				}
 				elemsByPeer[peer] = elemsForPeer
 			}
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.NewOutboundElement()
-			bufs[i] = elems[i].buffer[:]
+			elems[i] = replacement
+			bufs[i] = replacement.buffer[:]
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
@@ -466,7 +513,7 @@ top:
 	}
 
 	keypair := peer.keypairs.Current()
-	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+	if !keypairCanSend(keypair) {
 		peer.SendHandshakeInitiation(false)
 		return
 	}

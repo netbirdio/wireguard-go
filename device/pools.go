@@ -42,9 +42,25 @@ func (p *WaitPool) Get() any {
 // Timer.DelSync waits on that lock, so a callback parked in Get makes peer
 // removal and device close impossible.
 func (p *WaitPool) TryGet() (any, bool) {
+	return p.tryGet(false)
+}
+
+// TryGetReservingHalf is TryGet that also gives up once half of the cap is in
+// use. Packets staged for a peer that has no session yet take their buffer this
+// way, so peers that never complete a handshake cannot pin the whole pool and
+// starve the peers that can send.
+func (p *WaitPool) TryGetReservingHalf() (any, bool) {
+	return p.tryGet(true)
+}
+
+func (p *WaitPool) tryGet(reserveHalf bool) (any, bool) {
 	if p.tracked {
 		p.lock.Lock()
-		if p.max != 0 && p.count >= p.max {
+		limit := p.max
+		if reserveHalf {
+			limit /= 2
+		}
+		if p.max != 0 && p.count >= limit {
 			p.lock.Unlock()
 			return nil, false
 		}
@@ -104,6 +120,17 @@ func (device *Device) GetInboundElementsContainer() *QueueInboundElementsContain
 	return c
 }
 
+// TryGetInboundElementsContainer is GetInboundElementsContainer without the wait.
+func (device *Device) TryGetInboundElementsContainer() (*QueueInboundElementsContainer, bool) {
+	v, ok := device.pool.inboundElementsContainer.TryGet()
+	if !ok {
+		return nil, false
+	}
+	c := v.(*QueueInboundElementsContainer)
+	c.Mutex = sync.Mutex{}
+	return c, true
+}
+
 func (device *Device) PutInboundElementsContainer(c *QueueInboundElementsContainer) {
 	for i := range c.elems {
 		c.elems[i] = nil
@@ -156,6 +183,34 @@ func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
 
 func (device *Device) GetInboundElement() *QueueInboundElement {
 	return device.pool.inboundElements.Get().(*QueueInboundElement)
+}
+
+// TryGetInboundElement is GetInboundElement without the wait.
+func (device *Device) TryGetInboundElement() (*QueueInboundElement, bool) {
+	v, ok := device.pool.inboundElements.TryGet()
+	if !ok {
+		return nil, false
+	}
+	return v.(*QueueInboundElement), true
+}
+
+// tryNewInboundElement takes an inbound element and the buffer that replaces
+// the one the element is about to own, without waiting. A receive goroutine
+// parked in Get when a capped pool runs dry stops inbound traffic for every
+// peer and, since Peer.Stop and Device.Close wait for it, peer removal and
+// close too. The caller drops the packet instead, as the kernel does when
+// allocation fails, and the sender retransmits.
+func (device *Device) tryNewInboundElement() (*QueueInboundElement, *[MaxMessageSize]byte, bool) {
+	replacement, ok := device.TryGetMessageBuffer()
+	if !ok {
+		return nil, nil, false
+	}
+	elem, ok := device.TryGetInboundElement()
+	if !ok {
+		device.PutMessageBuffer(replacement)
+		return nil, nil, false
+	}
+	return elem, replacement, true
 }
 
 func (device *Device) PutInboundElement(elem *QueueInboundElement) {

@@ -76,6 +76,7 @@ type Device struct {
 		messageBuffers            *WaitPool
 		inboundElements           *WaitPool
 		outboundElements          *WaitPool
+		drops                     atomic.Uint64 // packets dropped for want of a pool buffer
 	}
 
 	queue struct {
@@ -365,6 +366,12 @@ func (device *Device) SetMaxBatchSize(n int) {
 		n = 0
 	}
 	device.batchSizeOverride.Store(int32(n))
+}
+
+// PoolDrops returns how many packets the TUN reader and the receive routines
+// dropped because a capped pool had no buffer to spare.
+func (device *Device) PoolDrops() uint64 {
+	return device.pool.drops.Load()
 }
 
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
