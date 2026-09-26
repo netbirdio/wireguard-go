@@ -13,3 +13,7 @@ import "net"
 func supportsUDPOffload(_ *net.UDPConn) (txOffload, rxOffload bool) {
 	return
 }
+
+func disableUDPGRO(_ *net.UDPConn) error {
+	return nil
+}

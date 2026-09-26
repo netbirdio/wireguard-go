@@ -266,7 +266,7 @@ func (s *StdNetBind) receiveIP(
 				return 0, err
 			}
 		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
+			numMsgs, err = br.ReadBatch((*msgs)[:len(bufs)], 0)
 			if err != nil {
 				return 0, err
 			}
@@ -293,14 +293,32 @@ func (s *StdNetBind) receiveIP(
 	return numMsgs, nil
 }
 
+// rxOffloadFor reports whether a read of batch buffers on conn may still use
+// GRO. A coalesced read uses the tail of a full IdealBatchSize message array
+// as scratch space and needs up to udpSegmentMaxDatagrams buffers per message.
+// A caller reading smaller batches provides neither: its datagrams would land
+// in message slots that carry no buffer and be truncated to nothing. GRO is
+// therefore turned off on the socket the first time such a batch shows up, so
+// the kernel delivers one datagram per message from then on. Should that fail,
+// reading one datagram per slot is still the only read that fits the buffers.
+func rxOffloadFor(conn *net.UDPConn, rxOffload bool, batch int) bool {
+	if !rxOffload || batch >= IdealBatchSize {
+		return rxOffload
+	}
+	_ = disableUDPGRO(conn)
+	return false
+}
+
 func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+		rxOffload = rxOffloadFor(conn, rxOffload, len(bufs))
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}
 }
 
 func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+		rxOffload = rxOffloadFor(conn, rxOffload, len(bufs))
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}
 }
