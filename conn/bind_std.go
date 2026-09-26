@@ -47,7 +47,32 @@ type StdNetBind struct {
 	blackhole4 bool
 	blackhole6 bool
 
+	// recvBatch is how many buffers the Device hands each receive call, set
+	// through SetRecvBatchSize before Open; zero means IdealBatchSize.
+	recvBatch int
+
 	receiverCreator ReceiverCreator
+}
+
+// SetRecvBatchSize tells the bind how many buffers the Device hands each
+// receive call. A socket opened for a batch below IdealBatchSize never has
+// GRO enabled, since such reads cannot split a coalesced datagram and GRO
+// cannot be turned off later without losing whatever was coalesced in the
+// meantime. Zero means IdealBatchSize.
+func (s *StdNetBind) SetRecvBatchSize(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recvBatch = n
+}
+
+// wantGRO reports whether the sockets opened next may use GRO: only when
+// neither the bind's own batch size nor the package-level override is below
+// IdealBatchSize. Called with mu held.
+func (s *StdNetBind) wantGRO() bool {
+	if s.recvBatch > 0 && s.recvBatch < IdealBatchSize {
+		return false
+	}
+	return !batchSizeOverrideBelowIdeal()
 }
 
 func NewStdNetBindWithReceiverCreator(receiverCreator ReceiverCreator) *StdNetBind {
@@ -127,8 +152,14 @@ func (e *StdNetEndpoint) DstToString() string {
 	return e.AddrPort.String()
 }
 
-func listenNet(network string, port int) (*net.UDPConn, int, error) {
-	conn, err := listenConfig().ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
+// listenNet opens a socket for network on port, enabling GRO before bind when
+// gro is set.
+func listenNet(network string, port int, gro bool) (*net.UDPConn, int, error) {
+	var extra []controlFn
+	if gro {
+		extra = append(extra, enableUDPGRO)
+	}
+	conn, err := listenConfig(extra...).ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -163,14 +194,15 @@ again:
 	var v4conn, v6conn *net.UDPConn
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
+	gro := s.wantGRO()
 
-	v4conn, port, err = listenNet("udp4", port)
+	v4conn, port, err = listenNet("udp4", port, gro)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
 		return nil, 0, err
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet("udp6", port)
+	v6conn, port, err = listenNet("udp6", port, gro)
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		v4conn.Close()
 		tries++
@@ -266,7 +298,7 @@ func (s *StdNetBind) receiveIP(
 				return 0, err
 			}
 		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
+			numMsgs, err = br.ReadBatch((*msgs)[:len(bufs)], 0)
 			if err != nil {
 				return 0, err
 			}
@@ -293,14 +325,36 @@ func (s *StdNetBind) receiveIP(
 	return numMsgs, nil
 }
 
+// rxOffloadFor reports whether a read of batch buffers on conn may still use
+// GRO. A coalesced read uses the tail of a full IdealBatchSize message array
+// as scratch space and needs up to udpSegmentMaxDatagrams buffers per message.
+// A caller reading smaller batches provides neither: its datagrams would land
+// in message slots that carry no buffer and be truncated to nothing. A Device
+// hands the bind its batch size before Open, so a socket read in small batches
+// never has GRO on; this only concerns a receive function driven without that
+// call. GRO is then turned off on the socket the first time such a batch shows
+// up, so the kernel delivers one datagram per message from then on, at the cost
+// of whatever it coalesced before that read, which arrives as one datagram.
+// Should the switch fail, reading one datagram per slot is still the only read
+// that fits the buffers.
+func rxOffloadFor(conn *net.UDPConn, rxOffload bool, batch int) bool {
+	if !rxOffload || batch >= IdealBatchSize {
+		return rxOffload
+	}
+	_ = disableUDPGRO(conn)
+	return false
+}
+
 func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+		rxOffload = rxOffloadFor(conn, rxOffload, len(bufs))
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}
 }
 
 func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+		rxOffload = rxOffloadFor(conn, rxOffload, len(bufs))
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}
 }
