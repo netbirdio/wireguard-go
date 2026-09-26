@@ -100,6 +100,13 @@ func init() {
 				return nil
 			}
 
+			// Reads smaller than IdealBatchSize cannot split a coalesced
+			// datagram, and turning GRO off later would leave any datagram
+			// coalesced in the meantime to be read as one; see rxOffloadFor.
+			if batchSizeOverrideBelowIdeal() {
+				return nil
+			}
+
 			c.Control(func(fd uintptr) {
 				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
 			})

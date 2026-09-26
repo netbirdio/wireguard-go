@@ -297,10 +297,13 @@ func (s *StdNetBind) receiveIP(
 // GRO. A coalesced read uses the tail of a full IdealBatchSize message array
 // as scratch space and needs up to udpSegmentMaxDatagrams buffers per message.
 // A caller reading smaller batches provides neither: its datagrams would land
-// in message slots that carry no buffer and be truncated to nothing. GRO is
-// therefore turned off on the socket the first time such a batch shows up, so
-// the kernel delivers one datagram per message from then on. Should that fail,
-// reading one datagram per slot is still the only read that fits the buffers.
+// in message slots that carry no buffer and be truncated to nothing. A socket
+// opened under MaxBatchSizeOverride never has GRO on, so this only concerns a
+// Device with a per-instance override: GRO is turned off on the socket the
+// first time such a batch shows up, so the kernel delivers one datagram per
+// message from then on, at the cost of whatever it coalesced before that read,
+// which arrives as one datagram. Should the switch fail, reading one datagram
+// per slot is still the only read that fits the buffers.
 func rxOffloadFor(conn *net.UDPConn, rxOffload bool, batch int) bool {
 	if !rxOffload || batch >= IdealBatchSize {
 		return rxOffload
