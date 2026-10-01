@@ -30,6 +30,7 @@ type Peer struct {
 		val            conn.Endpoint
 		clearSrcOnTx   bool // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
+		cleared        bool
 	}
 
 	timers struct {
