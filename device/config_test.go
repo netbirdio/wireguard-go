@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"slices"
@@ -182,6 +183,29 @@ func TestConfigurePeerUpdateOnlySkipsAbsentPeer(t *testing.T) {
 	}
 	if got := len(dev.Peers()); got != 0 {
 		t.Fatalf("peers on device: %d, want 0", got)
+	}
+}
+
+func TestConfigurePeerRejectsOutOfRangeKeepalive(t *testing.T) {
+	dev := newConfigTestDevice(t)
+
+	for _, keepalive := range []time.Duration{-time.Second, (math.MaxUint16 + 1) * time.Second} {
+		pk := randomPublicKey(t)
+		if err := dev.ConfigurePeer(pk, PeerConfig{PersistentKeepalive: &keepalive}); err == nil {
+			t.Fatalf("keepalive %v: want error", keepalive)
+		}
+		if dev.LookupPeer(pk) != nil {
+			t.Fatalf("keepalive %v: rejected config must not create a peer", keepalive)
+		}
+	}
+
+	pk := randomPublicKey(t)
+	keepalive := math.MaxUint16*time.Second + 500*time.Millisecond
+	if err := dev.ConfigurePeer(pk, PeerConfig{PersistentKeepalive: &keepalive}); err != nil {
+		t.Fatalf("configure peer: %v", err)
+	}
+	if got := dev.LookupPeer(pk).persistentKeepaliveInterval.Load(); got != math.MaxUint16 {
+		t.Fatalf("keepalive interval: %d, want %d", got, math.MaxUint16)
 	}
 }
 

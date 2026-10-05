@@ -6,6 +6,8 @@
 package device
 
 import (
+	"fmt"
+	"math"
 	"net/netip"
 	"time"
 
@@ -33,10 +35,18 @@ func (device *Device) ConfigurePeer(pk NoisePublicKey, cfg PeerConfig) error {
 	}
 
 	state := ipcSetPeer{Peer: device.LookupPeer(pk)}
-	if state.Peer == nil {
-		if cfg.UpdateOnly {
-			return nil
+	if state.Peer == nil && cfg.UpdateOnly {
+		return nil
+	}
+	var keepaliveSecs uint32
+	if cfg.PersistentKeepalive != nil {
+		secs, err := keepaliveSeconds(*cfg.PersistentKeepalive)
+		if err != nil {
+			return err
 		}
+		keepaliveSecs = secs
+	}
+	if state.Peer == nil {
 		peer, err := device.NewPeer(pk)
 		if err != nil {
 			return err
@@ -52,7 +62,7 @@ func (device *Device) ConfigurePeer(pk NoisePublicKey, cfg PeerConfig) error {
 		state.endpointChanged = state.setEndpoint(cfg.Endpoint)
 	}
 	if cfg.PersistentKeepalive != nil {
-		state.pkaOn = state.setPersistentKeepalive(uint32(cfg.PersistentKeepalive.Seconds()))
+		state.pkaOn = state.setPersistentKeepalive(keepaliveSecs)
 	}
 	if cfg.ReplaceAllowedIPs {
 		device.allowedips.replaceForPeer(state.Peer, cfg.AllowedIPs)
@@ -184,4 +194,12 @@ func (peer *Peer) setEndpoint(endpoint conn.Endpoint) bool {
 func (peer *Peer) setPersistentKeepalive(secs uint32) bool {
 	old := peer.persistentKeepaliveInterval.Swap(secs)
 	return old == 0 && secs != 0
+}
+
+func keepaliveSeconds(interval time.Duration) (uint32, error) {
+	secs := interval / time.Second
+	if interval < 0 || secs > math.MaxUint16 {
+		return 0, fmt.Errorf("invalid persistent keepalive interval: %v", interval)
+	}
+	return uint32(secs), nil
 }
