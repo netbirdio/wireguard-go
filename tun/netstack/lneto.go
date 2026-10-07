@@ -103,6 +103,8 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 		MaxActiveTCPPorts: 256,
 		MaxActiveUDPPorts: 256,
 		DNSServer:         dnsServer,
+		Nanotime:          nanotime,
+		Entropy:           crand.Reader.Read,
 	}
 	if dev.hasV6 {
 		cfg.StaticAddress6 = staticAddr6
@@ -144,7 +146,6 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 			EstablishedTimeout: 30 * time.Second,
 			ClosingTimeout:     10 * time.Second,
 			NewBackoff:         newTCPBackoff, // required: StackGo panics if nil.
-			NanoTime:           nanotime,
 			NewPolicy: func() tcp.Policy {
 				rto := new(rto.Timer)
 				rto.Configure(nanotime)
@@ -452,10 +453,15 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 	if ip, err := netip.ParseAddr(host[:zlen]); err == nil {
 		return []string{ip.String()}, nil
 	}
+
 	if !isDomainName(host) {
 		return nil, dnsError(host, "", errNoSuchHost, true)
 	}
-
+	var hostname dns.Name
+	err := hostname.Parse(host)
+	if err != nil {
+		return nil, dnsError(host, "", errNoSuchHost, true)
+	}
 	timeout := 5 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
 		if rem := time.Until(dl); rem < timeout {
@@ -465,14 +471,14 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 	var addrsV4, addrsV6 []netip.Addr
 	var lastErr error
 	if n.hasV4 {
-		if a, err := n.lookupIPType(ctx, host, dns.TypeA, timeout); err != nil {
+		if a, err := n.lookupIPType(ctx, hostname, dns.TypeA, timeout); err != nil {
 			lastErr = dnsError(host, "", err, false)
 		} else {
 			addrsV4 = a
 		}
 	}
 	if n.hasV6 {
-		if a, err := n.lookupIPType(ctx, host, dns.TypeAAAA, timeout); err != nil {
+		if a, err := n.lookupIPType(ctx, hostname, dns.TypeAAAA, timeout); err != nil {
 			if lastErr == nil {
 				lastErr = dnsError(host, "", err, false)
 			}
@@ -505,7 +511,7 @@ var errNoDNSServer = errors.New("no DNS server configured")
 
 // lookupIPType resolves host for a single record type, selecting the DNS transport:
 // TCP by default (see CreateNetTUNLneto) or the legacy UDP path when dnsUDP is set.
-func (n *lnetoStack) lookupIPType(ctx context.Context, host string, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+func (n *lnetoStack) lookupIPType(ctx context.Context, host dns.Name, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
 	if n.dnsUDP {
 		return n.sa.StackBlocking(n.backoff).DoLookupIPType(host, timeout, qtype)
 	}
@@ -516,7 +522,7 @@ func (n *lnetoStack) lookupIPType(ctx context.Context, host string, qtype dns.Ty
 // by a two-byte length field), dialing the configured DNS server on port 53 using the
 // lneto TCP socket. It mirrors the gvisor backend's dnsStreamRoundTrip but builds and
 // parses the message with lneto's dns package. IPv4 transport only, matching the UDP path.
-func (n *lnetoStack) lookupTCP(ctx context.Context, host string, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+func (n *lnetoStack) lookupTCP(ctx context.Context, host dns.Name, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
 	if !n.dnsServer.IsValid() {
 		return nil, errNoDNSServer
 	}
@@ -580,14 +586,10 @@ type dnsScratch struct {
 // buildQuery resets the scratch, encodes a single-question recursion-desired
 // query for host/qtype with txid, and returns the 2-byte-length-prefixed wire
 // bytes (aliases buf; valid until the next scratch use).
-func (s *dnsScratch) buildQuery(host string, qtype dns.Type, txid uint16) ([]byte, error) {
-	name, err := dns.NewName(host)
-	if err != nil {
-		return nil, err
-	}
+func (s *dnsScratch) buildQuery(host dns.Name, qtype dns.Type, txid uint16) (_ []byte, err error) {
 	// Layout: 2-byte length prefix followed by the message body.
 	s.msg.Reset()
-	s.msg.AddQuestions([]dns.Question{{Name: name, Type: qtype, Class: dns.ClassINET}})
+	s.msg.AddQuestions([]dns.Question{{Name: host, Type: qtype, Class: dns.ClassINET}})
 	msglen := s.msg.Len()
 	s.buf = slices.Grow(s.buf[:0], int(msglen)+2)[:2]
 	binary.BigEndian.PutUint16(s.buf[:2], msglen)
@@ -615,7 +617,7 @@ func (s *dnsScratch) readResponse(r io.Reader) ([]byte, error) {
 // parseAnswers validates msg against txid (TxID, IsResponse, ResponseCode),
 // decodes it, and returns a freshly cloned slice of answer addresses for host.
 // Returns the DNS rcode as error when non-zero.
-func (s *dnsScratch) parseAnswers(msg []byte, txid uint16, host string) ([]netip.Addr, error) {
+func (s *dnsScratch) parseAnswers(msg []byte, txid uint16, host dns.Name) ([]netip.Addr, error) {
 	f, err := dns.NewFrame(msg)
 	if err != nil {
 		return nil, err

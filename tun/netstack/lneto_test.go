@@ -514,8 +514,8 @@ func handleDNSOverTCP(conn net.Conn, host string, ip netip.Addr) error {
 	}
 	txid := f.TxID()
 
-	name, err := dns.NewName(host)
-	if err != nil {
+	var name dns.Name
+	if err := name.Parse(host); err != nil {
 		return err
 	}
 	var resp dns.Message
