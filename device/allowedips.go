@@ -256,7 +256,7 @@ func (node *trieEntry) remove() {
 	parent.zeroizePointers()
 }
 
-func (table *AllowedIPs) Remove(prefix netip.Prefix, peer *Peer) {
+func (table *AllowedIPs) Remove(prefix netip.Prefix, peer *Peer) bool {
 	table.mutex.Lock()
 	defer table.mutex.Unlock()
 	var node *trieEntry
@@ -272,15 +272,34 @@ func (table *AllowedIPs) Remove(prefix netip.Prefix, peer *Peer) {
 		panic(errors.New("removing unknown address type"))
 	}
 	if !exact || node == nil || peer != node.peer {
-		return
+		return false
 	}
 	node.remove()
+	return true
 }
 
 func (table *AllowedIPs) RemoveByPeer(peer *Peer) {
 	table.mutex.Lock()
 	defer table.mutex.Unlock()
+	table.removeByPeerLocked(peer)
+}
 
+func (table *AllowedIPs) Insert(prefix netip.Prefix, peer *Peer) {
+	table.mutex.Lock()
+	defer table.mutex.Unlock()
+	table.insertLocked(prefix, peer)
+}
+
+func (table *AllowedIPs) replaceForPeer(peer *Peer, prefixes []netip.Prefix) {
+	table.mutex.Lock()
+	defer table.mutex.Unlock()
+	table.removeByPeerLocked(peer)
+	for _, prefix := range prefixes {
+		table.insertLocked(prefix, peer)
+	}
+}
+
+func (table *AllowedIPs) removeByPeerLocked(peer *Peer) {
 	var next *list.Element
 	for elem := peer.trieEntries.Front(); elem != nil; elem = next {
 		next = elem.Next()
@@ -288,10 +307,7 @@ func (table *AllowedIPs) RemoveByPeer(peer *Peer) {
 	}
 }
 
-func (table *AllowedIPs) Insert(prefix netip.Prefix, peer *Peer) {
-	table.mutex.Lock()
-	defer table.mutex.Unlock()
-
+func (table *AllowedIPs) insertLocked(prefix netip.Prefix, peer *Peer) {
 	if prefix.Addr().Is6() {
 		ip := prefix.Addr().As16()
 		parentIndirection{&table.IPv6, 2}.insert(ip[:], uint8(prefix.Bits()), peer)
