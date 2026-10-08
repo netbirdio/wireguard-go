@@ -5,6 +5,8 @@
 
 package device
 
+import "golang.zx2c4.com/wireguard/conn"
+
 // MaxBatchSizeOverride, when nonzero, replaces the per-Device batch size used
 // to size eager buffer allocations in RoutineReceiveIncoming and
 // RoutineReadFromTUN. Zero means "do not override" (Devices fall back to the
@@ -23,9 +25,11 @@ func SetPreallocatedBuffersPerPool(n uint32) {
 
 // SetMaxBatchSizeOverride sets the global batch size override applied to
 // Devices created after this call. Zero disables the override. Existing
-// Devices are unaffected; use Device.SetMaxBatchSize for per-instance.
+// Devices are unaffected; use Device.SetMaxBatchSize for per-instance. The
+// binds see the same value, so sockets opened for such Devices never use GRO.
 func SetMaxBatchSizeOverride(n uint32) {
 	MaxBatchSizeOverride = n
+	conn.SetMaxBatchSizeOverride(n)
 }
 
 // SetPreallocatedBuffersPerPool updates the cap on this Device's pools in

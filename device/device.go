@@ -76,6 +76,7 @@ type Device struct {
 		messageBuffers            *WaitPool
 		inboundElements           *WaitPool
 		outboundElements          *WaitPool
+		drops                     atomic.Uint64 // packets dropped for want of a pool buffer
 	}
 
 	queue struct {
@@ -367,6 +368,12 @@ func (device *Device) SetMaxBatchSize(n int) {
 	device.batchSizeOverride.Store(int32(n))
 }
 
+// PoolDrops returns how many packets the TUN reader and the receive routines
+// dropped because a capped pool had no buffer to spare.
+func (device *Device) PoolDrops() uint64 {
+	return device.pool.drops.Load()
+}
+
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	device.peers.RLock()
 	defer device.peers.RUnlock()
@@ -515,6 +522,12 @@ func (device *Device) BindUpdate() error {
 	var err error
 	var recvFns []conn.ReceiveFunc
 	netc := &device.net
+
+	// A bind that opens its sockets differently for small batches needs the
+	// batch size before Open; see conn.StdNetBind.SetRecvBatchSize.
+	if b, ok := netc.bind.(conn.RecvBatchSizer); ok {
+		b.SetRecvBatchSize(device.BatchSize())
+	}
 
 	recvFns, netc.port, err = netc.bind.Open(netc.port)
 	if err != nil {

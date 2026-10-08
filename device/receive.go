@@ -167,22 +167,31 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 				// create work element
 				peer := value.peer
-				elem := device.GetInboundElement()
+				elem, replacement, ok := device.tryNewInboundElement()
+				if !ok {
+					device.pool.drops.Add(1)
+					continue
+				}
+				elemsForPeer, ok := elemsByPeer[peer]
+				if !ok {
+					elemsForPeer, ok = device.TryGetInboundElementsContainer()
+					if !ok {
+						device.PutInboundElement(elem)
+						device.PutMessageBuffer(replacement)
+						device.pool.drops.Add(1)
+						continue
+					}
+					elemsForPeer.Lock()
+					elemsByPeer[peer] = elemsForPeer
+				}
 				elem.packet = packet
 				elem.buffer = bufsArrs[i]
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
-
-				elemsForPeer, ok := elemsByPeer[peer]
-				if !ok {
-					elemsForPeer = device.GetInboundElementsContainer()
-					elemsForPeer.Lock()
-					elemsByPeer[peer] = elemsForPeer
-				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				bufsArrs[i] = replacement
+				bufs[i] = replacement[:]
 				continue
 
 			// otherwise it is a fixed size & handshake related packet
@@ -207,6 +216,11 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				continue
 			}
 
+			replacement, ok := device.TryGetMessageBuffer()
+			if !ok {
+				device.pool.drops.Add(1)
+				continue
+			}
 			select {
 			case device.queue.handshake.c <- QueueHandshakeElement{
 				msgType:  msgType,
@@ -214,9 +228,10 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				packet:   packet,
 				endpoint: endpoints[i],
 			}:
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				bufsArrs[i] = replacement
+				bufs[i] = replacement[:]
 			default:
+				device.PutMessageBuffer(replacement)
 			}
 		}
 		for peer, elemsContainer := range elemsByPeer {

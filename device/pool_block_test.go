@@ -274,33 +274,18 @@ func onlyPeerKey(t *testing.T, dev *Device) NoisePublicKey {
 	return NoisePublicKey{}
 }
 
-// waitPoolDrained blocks until the message buffer pool has no capacity left.
-func waitPoolDrained(t *testing.T, dev *Device, within time.Duration) {
-	t.Helper()
-
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		buf, ok := dev.TryGetMessageBuffer()
-		if !ok {
-			return
-		}
-		dev.PutMessageBuffer(buf)
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("buffer pool never drained; the traffic generator is not filling the staged queue")
-}
-
 // TestRemovePeerWithPoolDrainedByADeadPeer is the functional counterpart of the
 // unit tests above: two real devices, a real handshake, real traffic and real
 // timers, asserting the property the deadlock broke.
 //
 // The shape is the one seen in production. One peer cannot handshake, so the
-// packets aimed at it stay staged and drain the device's capped pool. A second
-// peer has a live session, so its staged queue is empty and its keepalive timer
-// does allocate - and parks in the exhausted pool while holding the timer's
-// runningLock. Removing that peer needs the same lock through DelSync, so it
-// can never complete. With the fix the keepalive is skipped and the removal
-// returns.
+// packets aimed at it stay staged and pin their share of the device's capped
+// pool; the test holds whatever the staging share leaves, so the pool is
+// exhausted. A second peer has a live session, so its staged queue is empty and
+// its keepalive timer does allocate - and used to park in the exhausted pool
+// while holding the timer's runningLock. Removing that peer needs the same lock
+// through DelSync, so it could never complete. With the fix the keepalive is
+// skipped and the removal returns.
 func TestRemovePeerWithPoolDrainedByADeadPeer(t *testing.T) {
 	prev := PreallocatedBuffersPerPool
 	SetPreallocatedBuffersPerPool(32)
@@ -351,7 +336,9 @@ func TestRemovePeerWithPoolDrainedByADeadPeer(t *testing.T) {
 		}
 	}()
 
-	waitPoolDrained(t, dev, 10*time.Second)
+	// Give the flood a moment to stage its share, then take the rest.
+	time.Sleep(500 * time.Millisecond)
+	holdSpareBuffers(t, dev)
 
 	// Let a keepalive tick land on the drained pool. Before the fix the first
 	// one parks and never returns, so this is not a race: once parked, parked.
