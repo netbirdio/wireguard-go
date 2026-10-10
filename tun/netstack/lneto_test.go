@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -534,4 +535,184 @@ func handleDNSOverTCP(conn net.Conn, host string, ip netip.Addr) error {
 	copy(framed[2:], msg)
 	_, err = conn.Write(framed)
 	return err
+}
+
+// TestDNSParseAnswers checks that a DNS-over-TCP response is accepted only when it
+// answers the query sent, and that only addresses of the queried family are returned.
+func TestDNSParseAnswers(t *testing.T) {
+	const txid = 0x1234
+	host := dns.MustNewName("example.com")
+	a4 := netip.MustParseAddr("1.2.3.4").As4()
+	a6 := netip.MustParseAddr("2001:db8::1").As16()
+	const okFlags dns.HeaderFlags = 1<<15 | 1<<7 // QR=1, RA=1, RCODE=0.
+	build := func(txid uint16, flags dns.HeaderFlags, qs []dns.Question, ans ...dns.Resource) []byte {
+		var m dns.Message
+		m.AddQuestions(qs)
+		m.Answers = ans
+		msg, err := m.AppendTo(nil, txid, flags)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return msg
+	}
+	q := func(name string, qtype dns.Type) []dns.Question {
+		return []dns.Question{{Name: dns.MustNewName(name), Type: qtype, Class: dns.ClassINET}}
+	}
+	rrA := dns.NewResource(host, dns.TypeA, dns.ClassINET, 300, a4[:])
+	rrAAAA := dns.NewResource(host, dns.TypeAAAA, dns.ClassINET, 300, a6[:])
+	rrA16 := dns.NewResource(host, dns.TypeA, dns.ClassINET, 300, a6[:]) // malformed: 16-byte A.
+
+	tests := []struct {
+		name    string
+		msg     []byte
+		want    []netip.Addr
+		wantErr error
+	}{
+		{"ok", build(txid, okFlags, q("example.com", dns.TypeA), rrA), []netip.Addr{netip.AddrFrom4(a4)}, nil},
+		{"question case folded", build(txid, okFlags, q("EXAMPLE.com", dns.TypeA), rrA), []netip.Addr{netip.AddrFrom4(a4)}, nil},
+		{"txid mismatch", build(txid+1, okFlags, q("example.com", dns.TypeA), rrA), nil, errInvalidDNSResponse},
+		{"not a response", build(txid, okFlags&^(1<<15), q("example.com", dns.TypeA), rrA), nil, errInvalidDNSResponse},
+		{"no question", build(txid, okFlags, nil, rrA), nil, errInvalidDNSResponse},
+		{"other name", build(txid, okFlags, q("evil.com", dns.TypeA), rrA), nil, errInvalidDNSResponse},
+		{"other type", build(txid, okFlags, q("example.com", dns.TypeAAAA), rrA), nil, errInvalidDNSResponse},
+		{"nxdomain", build(txid, okFlags|dns.HeaderFlags(dns.RCodeNameError), q("example.com", dns.TypeA)), nil, dns.RCodeNameError},
+		{"wrong family dropped", build(txid, okFlags, q("example.com", dns.TypeA), rrAAAA, rrA16, rrA), []netip.Addr{netip.AddrFrom4(a4)}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s dnsScratch
+			got, err := s.parseAnswers(tt.msg, txid, host, dns.TypeA)
+			if err != tt.wantErr {
+				t.Fatalf("err: want %v got %v", tt.wantErr, err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("addrs: want %v got %v", tt.want, got)
+			}
+		})
+	}
+}
+
+// TestNet2_DNSUDPConcurrentLookups runs more concurrent LookupContextHost calls
+// over the UDP DNS path than the stack has lookup slots. The responder holds its
+// answers until maxDNSLookups queries are in flight, so lookups beyond the slots
+// only succeed if they wait for a free slot rather than fail with ErrExhausted.
+func TestNet2_DNSUDPConcurrentLookups(t *testing.T) {
+	const (
+		addrA    = "10.0.0.1"
+		addrB    = "10.0.0.2" // also the DNS server address for netA.
+		host     = "example.com"
+		nLookups = 2 * maxDNSLookups
+	)
+	wantIP := netip.MustParseAddr("1.2.3.4")
+
+	devA, netA, err := CreateNetTUNLneto(
+		[]netip.Addr{netip.MustParseAddr(addrA)},
+		[]netip.Addr{netip.MustParseAddr(addrB)},
+		1500,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devA.(*lnetoStack).dnsUDP = true
+	devB, netB, err := CreateNetTUNLneto([]netip.Addr{netip.MustParseAddr(addrB)}, nil, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-devA.Events()
+	<-devB.Events()
+
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go func() { defer pumps.Done(); pump(devA, devB) }()
+	go func() { defer pumps.Done(); pump(devB, devA) }()
+	defer func() {
+		devA.Close()
+		devB.Close()
+		pumps.Wait()
+	}()
+
+	srv, err := netB.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(addrB), dns.ServerPort))
+	if err != nil {
+		t.Fatal("listen dns:", err)
+	}
+	defer srv.Close()
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- serveDNSOverUDPBatched(srv, wantIP, nLookups, maxDNSLookups) }()
+
+	results := make([]error, nLookups)
+	var lookups sync.WaitGroup
+	lookups.Add(nLookups)
+	for i := range results {
+		go func() {
+			defer lookups.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			addrs, err := netA.LookupContextHost(ctx, host)
+			if err != nil {
+				results[i] = err
+			} else if len(addrs) != 1 || addrs[0] != wantIP.String() {
+				results[i] = fmt.Errorf("want [%s] got %v", wantIP, addrs)
+			}
+		}()
+	}
+	lookups.Wait()
+	for i, err := range results {
+		if err != nil {
+			t.Errorf("lookup %d: %v", i, err)
+		}
+	}
+	if err := <-srvDone; err != nil {
+		t.Error("dns server:", err)
+	}
+}
+
+// serveDNSOverUDPBatched answers n UDP DNS queries with an A record (ip) for the
+// queried name, replying only once batch queries have arrived.
+func serveDNSOverUDPBatched(srv UDPConn, ip netip.Addr, n, batch int) error {
+	srv.SetDeadline(time.Now().Add(5 * time.Second))
+	ip4 := ip.As4()
+	type pending struct {
+		resp []byte
+		from net.Addr
+	}
+	var held []pending
+	buf := make([]byte, 1500)
+	for served := 0; served < n; {
+		nr, from, err := srv.ReadFrom(buf)
+		if err != nil {
+			return err
+		}
+		f, err := dns.NewFrame(buf[:nr])
+		if err != nil {
+			return err
+		}
+		var query dns.Message
+		query.LimitResourceDecoding(1, 0, 0, 1)
+		if _, incompleteButOK, err := query.Decode(buf[:nr]); err != nil && !incompleteButOK {
+			return err
+		} else if len(query.Questions) != 1 {
+			return errors.New("query without question")
+		}
+		q := query.Questions[0]
+		var resp dns.Message
+		resp.AddQuestions([]dns.Question{q})
+		resp.Answers = append(resp.Answers, dns.NewResource(q.Name, dns.TypeA, dns.ClassINET, 300, ip4[:]))
+		const respFlags dns.HeaderFlags = 1<<15 | 1<<7 // QR=1, RA=1, RCODE=0.
+		msg, err := resp.AppendTo(nil, f.TxID(), respFlags)
+		if err != nil {
+			return err
+		}
+		held = append(held, pending{msg, from})
+		if len(held) < batch && served+len(held) < n {
+			continue
+		}
+		for _, p := range held {
+			if _, err := srv.WriteTo(p.resp, p.from); err != nil {
+				return err
+			}
+		}
+		served += len(held)
+		held = held[:0]
+	}
+	return nil
 }

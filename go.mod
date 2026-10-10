@@ -3,7 +3,7 @@ module golang.zx2c4.com/wireguard
 go 1.24
 
 require (
-	github.com/soypat/lneto v0.3.3-0.20261007161758-a861132b3121
+	github.com/soypat/lneto v0.3.3-0.20261008193519-6f844c24ff8f
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.39.0
 	golang.org/x/sys v0.32.0

@@ -28,6 +28,9 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
+// maxDNSLookups is how many UDP DNS lookups the stack runs at once.
+const maxDNSLookups = 4
+
 func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
 	if mtu <= 0 {
 		mtu = 1500
@@ -40,6 +43,7 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 		closed:     make(chan struct{}),
 		mtu:        mtu,
 		dnsServers: dnsServers,
+		dnsUDPSem:  make(chan struct{}, maxDNSLookups),
 	}
 
 	var hwAddr [6]byte
@@ -103,6 +107,7 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 		MaxActiveTCPPorts: 256,
 		MaxActiveUDPPorts: 256,
 		DNSServer:         dnsServer,
+		MaxDNSLookups:     maxDNSLookups,
 		Nanotime:          nanotime,
 		Entropy:           crand.Reader.Read,
 	}
@@ -209,6 +214,10 @@ type lnetoStack struct {
 	// mutex held that long would serialize concurrent lookups on a lock that
 	// cannot observe their contexts.
 	dnsPool sync.Pool
+	// dnsUDPSem bounds lookups on the UDP DNS path to the stack's maxDNSLookups
+	// slots, which fails lookups beyond that with ErrExhausted: excess lookups wait
+	// instead. A channel rather than a mutex so that waiting honors ctx.
+	dnsUDPSem chan struct{}
 }
 
 type event struct{}
@@ -472,7 +481,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 	var lastErr error
 	if n.hasV4 {
 		if a, err := n.lookupIPType(ctx, hostname, dns.TypeA, timeout); err != nil {
-			lastErr = dnsError(host, "", err, false)
+			lastErr = dnsError(host, "", err, err == errNoSuchHost)
 		} else {
 			addrsV4 = a
 		}
@@ -480,7 +489,7 @@ func (n *lnetoStack) LookupContextHost(ctx context.Context, host string) ([]stri
 	if n.hasV6 {
 		if a, err := n.lookupIPType(ctx, hostname, dns.TypeAAAA, timeout); err != nil {
 			if lastErr == nil {
-				lastErr = dnsError(host, "", err, false)
+				lastErr = dnsError(host, "", err, err == errNoSuchHost)
 			}
 		} else {
 			addrsV6 = a
@@ -511,11 +520,36 @@ var errNoDNSServer = errors.New("no DNS server configured")
 
 // lookupIPType resolves host for a single record type, selecting the DNS transport:
 // TCP by default (see CreateNetTUNLneto) or the legacy UDP path when dnsUDP is set.
-func (n *lnetoStack) lookupIPType(ctx context.Context, host dns.Name, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+func (n *lnetoStack) lookupIPType(ctx context.Context, host dns.Name, qtype dns.Type, timeout time.Duration) (addrs []netip.Addr, err error) {
 	if n.dnsUDP {
-		return n.sa.StackBlocking(n.backoff).DoLookupIPType(host, timeout, qtype)
+		addrs, err = n.lookupUDP(ctx, host, qtype, timeout)
+	} else {
+		addrs, err = n.lookupTCP(ctx, host, qtype, timeout)
 	}
-	return n.lookupTCP(ctx, host, qtype, timeout)
+	if err == dns.RCodeNameError || err == dns.ErrNoAnswer {
+		err = errNoSuchHost // NXDOMAIN or NODATA, reported as not found like the gvisor Net.
+	}
+	return addrs, err
+}
+
+// lookupUDP resolves over lneto's UDP DNS client, which matches responses to the
+// query (txid, opcode, question) and follows CNAME-only answers.
+func (n *lnetoStack) lookupUDP(ctx context.Context, host dns.Name, qtype dns.Type, timeout time.Duration) ([]netip.Addr, error) {
+	select {
+	case n.dnsUDPSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-n.dnsUDPSem }()
+	var addrs [16]netip.Addr
+	nAddr, err := n.sa.StackBlocking(n.backoff).DoLookupIPType(addrs[:], host, timeout, qtype)
+	if err == lneto.ErrExhausted && nAddr > 0 {
+		err = nil // More addresses than fit in addrs: keep those found, as the TCP path does.
+	}
+	if err != nil {
+		return nil, err
+	}
+	return keepFamily(slices.Clone(addrs[:nAddr]), qtype), nil
 }
 
 // lookupTCP performs a DNS query over TCP (RFC 1035 §4.2.2: each message is preceded
@@ -527,7 +561,11 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host dns.Name, qtype dns.Typ
 		return nil, errNoDNSServer
 	}
 
-	txid := uint16(n.sa.Prand32())
+	// Unpredictable txid (RFC 5452 §4.3). Not the stack's Prand32: it is xorshift,
+	// whose output is its whole state, so one observed ID predicts the next.
+	var txidb [2]byte
+	crand.Read(txidb[:]) // Never returns an error since Go 1.24; crashes instead.
+	txid := binary.BigEndian.Uint16(txidb[:])
 
 	// The scratch buffers are reused across the whole round trip (build → write →
 	// read → parse), so this call owns one exclusively until it returns. Taking it
@@ -568,7 +606,7 @@ func (n *lnetoStack) lookupTCP(ctx context.Context, host dns.Name, qtype dns.Typ
 	if err != nil {
 		return nil, err
 	}
-	return s.parseAnswers(msg, txid, host)
+	return s.parseAnswers(msg, txid, host, qtype)
 }
 
 // dnsScratch holds reusable buffers for building and parsing DNS-over-TCP
@@ -614,30 +652,46 @@ func (s *dnsScratch) readResponse(r io.Reader) ([]byte, error) {
 	return s.buf, nil
 }
 
-// parseAnswers validates msg against txid (TxID, IsResponse, ResponseCode),
-// decodes it, and returns a freshly cloned slice of answer addresses for host.
-// Returns the DNS rcode as error when non-zero.
-func (s *dnsScratch) parseAnswers(msg []byte, txid uint16, host dns.Name) ([]netip.Addr, error) {
+// parseAnswers validates msg against the query (TxID, IsResponse, ResponseCode and
+// the echoed question), decodes it, and returns a freshly cloned slice of the
+// qtype answer addresses for host. Returns the DNS rcode as error when non-zero.
+func (s *dnsScratch) parseAnswers(msg []byte, txid uint16, host dns.Name, qtype dns.Type) ([]netip.Addr, error) {
 	f, err := dns.NewFrame(msg)
 	if err != nil {
 		return nil, err
 	}
-	if f.TxID() != txid || !f.Flags().IsResponse() {
+	if f.TxID() != txid || !f.Flags().IsResponse() || f.QDCount() != 1 {
 		return nil, errInvalidDNSResponse
 	}
 	if rcode := f.Flags().ResponseCode(); rcode != 0 {
 		return nil, rcode
 	}
 	s.msg.Reset()
-	s.msg.LimitResourceDecoding(1, uint16(len(s.addrs)), 0, 4) // allow up to 16 answers to decode.
-	var nAns uint16
-	if _, incompleteButOK, derr := s.msg.Decode(msg); derr != nil && !incompleteButOK {
-		err = derr
-	} else {
-		nAns, err = s.msg.WriteAnswers(s.addrs[:], host)
+	// Headroom above the address buffer for CNAME records, which occupy answer
+	// slots before the addresses they alias.
+	s.msg.LimitResourceDecoding(1, uint16(len(s.addrs))+8, 0, 4)
+	if _, incompleteButOK, err := s.msg.Decode(msg); err != nil && !incompleteButOK {
+		return nil, err
 	}
+	// The response must answer the question asked, as the gvisor Net's checkResponse requires.
+	if len(s.msg.Questions) != 1 {
+		return nil, errInvalidDNSResponse
+	}
+	q := &s.msg.Questions[0]
+	if q.Type != qtype || q.Class != dns.ClassINET || !dns.NamesEqualFold(q.Name, host) {
+		return nil, errInvalidDNSResponse
+	}
+	nAns, err := s.msg.WriteAnswers(s.addrs[:], host)
 	if err != nil && err != lneto.ErrExhausted {
 		return nil, err
 	}
-	return slices.Clone(s.addrs[:nAns]), nil
+	return keepFamily(slices.Clone(s.addrs[:nAns]), qtype), nil
+}
+
+// keepFamily drops, in place, addresses whose family does not match qtype:
+// WriteAnswers collects both A and AAAA records, and an A record with a 16-byte
+// payload decodes as an IPv6 address.
+func keepFamily(addrs []netip.Addr, qtype dns.Type) []netip.Addr {
+	want4 := qtype == dns.TypeA
+	return slices.DeleteFunc(addrs, func(a netip.Addr) bool { return a.Is4() != want4 })
 }
