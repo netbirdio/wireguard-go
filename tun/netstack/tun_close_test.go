@@ -13,14 +13,15 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// backends lists every netstack implementation. Close semantics are part of the
-// tun.Device contract, so each backend must pass the same tests regardless of
-// which one CreateNetTUN selects for the build.
-var backends = []struct {
+type backend struct {
 	name   string
 	create func(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error)
-}{
-	{"gvisor", CreateNetTUNGvisor},
+}
+
+// backends lists every netstack implementation in the build; gvisor_test.go adds
+// gvisor when it is compiled in. Close semantics are part of the tun.Device
+// contract, so each backend must pass the same tests.
+var backends = []backend{
 	{"lneto", CreateNetTUNLneto},
 }
 

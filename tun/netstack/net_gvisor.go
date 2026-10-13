@@ -1,4 +1,4 @@
-//go:build !wglneto
+//go:build !tinygo && !wglneto
 
 package netstack
 

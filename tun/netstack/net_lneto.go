@@ -1,4 +1,4 @@
-//go:build wglneto
+//go:build tinygo || wglneto
 
 package netstack
 
@@ -9,7 +9,8 @@ import (
 )
 
 // CreateNetTUN builds the lneto-backed netstack TUN device. This is the
-// implementation selected when building with -tags wglneto.
+// implementation selected when building with -tags wglneto, and always under
+// TinyGo, which cannot build gvisor.
 func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
 	return CreateNetTUNLneto(localAddresses, dnsServers, mtu)
 }

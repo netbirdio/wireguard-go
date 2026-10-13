@@ -1,4 +1,4 @@
-//go:build !tinygo
+//go:build !tinygo && !wglneto
 
 /* SPDX-License-Identifier: MIT
  *
@@ -824,14 +824,4 @@ func (tnet *netTun) LookupContextHost(ctx context.Context, host string) ([]strin
 		saddrs = append(saddrs, ip.String())
 	}
 	return saddrs, nil
-}
-
-// dnsError wraps a lookup failure as a *net.DNSError, flagging timeouts when the
-// underlying error reports them. Mirrors the error shape produced by the gvisor Net.
-func dnsError(host, server string, err error, isNotFound bool) *net.DNSError {
-	de := &net.DNSError{Err: err.Error(), Name: host, Server: server, IsNotFound: isNotFound}
-	if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-		de.IsTimeout = true
-	}
-	return de
 }
