@@ -9,25 +9,39 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+
+	"golang.zx2c4.com/wireguard/tun"
 )
 
-func newTestTUN(t *testing.T) *netTun {
-	t.Helper()
+// backends lists every netstack implementation. Close semantics are part of the
+// tun.Device contract, so each backend must pass the same tests regardless of
+// which one CreateNetTUN selects for the build.
+var backends = []struct {
+	name   string
+	create func(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error)
+}{
+	{"gvisor", CreateNetTUNGvisor},
+	{"lneto", CreateNetTUNLneto},
+}
 
-	dev, _, err := CreateNetTUN(
-		[]netip.Addr{netip.MustParseAddr("192.168.1.1")},
-		[]netip.Addr{netip.MustParseAddr("8.8.8.8")},
-		1280,
-	)
-	if err != nil {
-		t.Fatalf("create net TUN: %v", err)
+// forEachBackend runs test as a subtest against a fresh device per backend.
+func forEachBackend(t *testing.T, test func(t *testing.T, newDev func() tun.Device)) {
+	for _, b := range backends {
+		t.Run(b.name, func(t *testing.T) {
+			test(t, func() tun.Device {
+				t.Helper()
+				dev, _, err := b.create(
+					[]netip.Addr{netip.MustParseAddr("192.168.1.1")},
+					[]netip.Addr{netip.MustParseAddr("8.8.8.8")},
+					1280,
+				)
+				if err != nil {
+					t.Fatalf("create net TUN: %v", err)
+				}
+				return dev
+			})
+		})
 	}
-
-	tun, ok := dev.(*netTun)
-	if !ok {
-		t.Fatalf("CreateNetTUN returned %T, want *netTun", dev)
-	}
-	return tun
 }
 
 // TestNetTunCloseTwice covers the sequential case: Close must tolerate being
@@ -39,59 +53,65 @@ func newTestTUN(t *testing.T) *netTun {
 // references. Without the guard the second call closes an already closed
 // channel and panics the process.
 func TestNetTunCloseTwice(t *testing.T) {
-	tun := newTestTUN(t)
+	forEachBackend(t, func(t *testing.T, newDev func() tun.Device) {
+		dev := newDev()
 
-	if err := tun.Close(); err != nil {
-		t.Fatalf("first close: %v", err)
-	}
-	if err := tun.Close(); err != nil {
-		t.Fatalf("second close: %v", err)
-	}
+		if err := dev.Close(); err != nil {
+			t.Fatalf("first close: %v", err)
+		}
+		if err := dev.Close(); err != nil {
+			t.Fatalf("second close: %v", err)
+		}
+	})
 }
 
 // TestNetTunCloseConcurrent covers the case actually seen in the field: two
 // goroutines closing the same device at once, which is what a teardown racing
 // RoutineReadFromTUN looks like.
 func TestNetTunCloseConcurrent(t *testing.T) {
-	for i := 0; i < 50; i++ {
-		tun := newTestTUN(t)
+	forEachBackend(t, func(t *testing.T, newDev func() tun.Device) {
+		for i := 0; i < 50; i++ {
+			dev := newDev()
 
-		const closers = 8
-		var start sync.WaitGroup
-		var done sync.WaitGroup
-		start.Add(1)
-		done.Add(closers)
+			const closers = 8
+			var start sync.WaitGroup
+			var done sync.WaitGroup
+			start.Add(1)
+			done.Add(closers)
 
-		for c := 0; c < closers; c++ {
-			go func() {
-				defer done.Done()
-				start.Wait()
-				_ = tun.Close()
-			}()
+			for c := 0; c < closers; c++ {
+				go func() {
+					defer done.Done()
+					start.Wait()
+					_ = dev.Close()
+				}()
+			}
+
+			start.Done()
+			done.Wait()
 		}
-
-		start.Done()
-		done.Wait()
-	}
+	})
 }
 
 // TestNetTunEventsClosedOnce checks that the guard still closes the channels
 // rather than skipping the teardown: the events channel must be closed after
 // Close returns, so readers observing it are released.
 func TestNetTunEventsClosedOnce(t *testing.T) {
-	tun := newTestTUN(t)
+	forEachBackend(t, func(t *testing.T, newDev func() tun.Device) {
+		dev := newDev()
 
-	events := tun.Events()
-	if err := tun.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	// Drain whatever was already queued; the channel must then report closed
-	// rather than blocking, otherwise readers are never released.
-	for i := 0; i < 16; i++ {
-		if _, open := <-events; !open {
-			return
+		events := dev.Events()
+		if err := dev.Close(); err != nil {
+			t.Fatalf("close: %v", err)
 		}
-	}
-	t.Fatal("events channel never reported closed after Close")
+
+		// Drain whatever was already queued; the channel must then report closed
+		// rather than blocking, otherwise readers are never released.
+		for i := 0; i < 16; i++ {
+			if _, open := <-events; !open {
+				return
+			}
+		}
+		t.Fatal("events channel never reported closed after Close")
+	})
 }
