@@ -28,8 +28,46 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// maxDNSLookups is how many UDP DNS lookups the stack runs at once.
-const maxDNSLookups = 4
+// TCP sizing. lneto preallocates each listener's connections when the listener is
+// created (tcpPoolSize × 2 × tcpBufSize) and never allocates them afterwards, so these
+// constants fix both the memory budget and the throughput, which follows
+//
+//	throughput ≈ min(tcpQueueSize × MSS, tcpBufSize) / RTT
+//
+// Measured lneto↔lneto, one stream over a lossless link, MTU 1420 (MSS 1380):
+//
+//	pool × (rx+tx), queue          RAM/listener  10 ms RTT   50 ms RTT
+//	256 × (32+32 KiB), 8 (before)  16.6 MiB      1.0 MB/s    0.21 MB/s
+//	16 × (64+64 KiB), 48           2.0 MiB       5.0 MB/s    1.2 MB/s
+//	16 × (128+128 KiB), 96 (this)  4.0 MiB       9.4 MB/s    2.4 MB/s
+//	gVisor, allocates on demand    ~10 KiB       ~130 MB/s   38 MB/s
+//
+// A queue entry costs ~24 B per connection, so tcpQueueSize is sized to fill the
+// buffer (tcpBufSize/MSS); a larger queue adds nothing. StackGo also gives each
+// dialed TCP connection and each UDP socket these buffer and queue sizes, allocated
+// when the connection or socket is created.
+const (
+	// tcpPoolSize caps concurrent incoming connections per TCP listener; further SYNs are reset.
+	tcpPoolSize = 16
+	// tcpBufSize is each connection's receive and transmit buffer size. The receive
+	// buffer is the window advertised to the peer.
+	tcpBufSize = 128 << 10
+	// tcpQueueSize caps unacknowledged segments in flight: tcpBufSize/MSS, rounded up.
+	tcpQueueSize = 96
+
+	// maxTCPPorts caps TCP sockets per IP family: each listener and each dialed
+	// connection takes a port, accepted connections share their listener's. Further
+	// dials and listens fail with lneto.ErrExhausted. lneto keeps closed dialed
+	// connections referenced until the port table fills, so after enough dials
+	// maxTCPPorts × 2 × tcpBufSize (16 MiB) stays allocated per family.
+	maxTCPPorts = 64
+	// maxUDPPorts caps open UDP sockets per IP family: listeners, dials, and one per
+	// in-flight DNS upstream query. Each holds 2 × tcpBufSize until closed.
+	maxUDPPorts = 32
+
+	// maxDNSLookups is how many UDP DNS lookups the stack runs at once.
+	maxDNSLookups = 4
+)
 
 func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
 	if mtu <= 0 {
@@ -104,8 +142,8 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 		RandSeed:          randSeed,
 		PassivePeers:      0, // no ARP passive learning needed for TUN
 		ICMPQueueLimit:    4,
-		MaxActiveTCPPorts: 256,
-		MaxActiveUDPPorts: 256,
+		MaxActiveTCPPorts: maxTCPPorts,
+		MaxActiveUDPPorts: maxUDPPorts,
 		DNSServer:         dnsServer,
 		MaxDNSLookups:     maxDNSLookups,
 		Nanotime:          nanotime,
@@ -144,10 +182,10 @@ func CreateNetTUNLneto(localAddresses, dnsServers []netip.Addr, mtu int) (tun.De
 
 	dev.sgo = dev.sa.StackGo(backoff, xnet.StackGoConfig{
 		ListenerPoolConfig: xnet.TCPPoolConfig{
-			PoolSize:           256,
-			QueueSize:          8,
-			TxBufSize:          32 << 10,
-			RxBufSize:          32 << 10,
+			PoolSize:           tcpPoolSize,
+			QueueSize:          tcpQueueSize,
+			TxBufSize:          tcpBufSize,
+			RxBufSize:          tcpBufSize,
 			EstablishedTimeout: 30 * time.Second,
 			ClosingTimeout:     10 * time.Second,
 			NewBackoff:         newTCPBackoff, // required: StackGo panics if nil.
