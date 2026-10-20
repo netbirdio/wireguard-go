@@ -16,9 +16,10 @@ import (
 )
 
 // Net is the userspace networking API (Dial/Listen/DNS) layered over a backend
-// [Stack]. It is backend-agnostic: [CreateNetTUN] wraps the gvisor backend and
-// [CreateNetTUNLneto] wraps the lneto backend, but both return a *Net with the
-// same surface so callers can swap backends transparently.
+// [Stack]. It is backend-agnostic: [CreateNetTUN] wraps the gvisor backend by
+// default and the lneto backend when building with -tags wglneto or under TinyGo.
+// Only one backend is compiled in, but both return a *Net with the same surface so
+// callers can swap backends transparently.
 //
 // The backend object also implements [golang.zx2c4.com/wireguard/tun.Device]
 // (returned as the first value from the constructors) and is the data plane that

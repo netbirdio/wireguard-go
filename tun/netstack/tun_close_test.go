@@ -18,12 +18,10 @@ type backend struct {
 	create func(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error)
 }
 
-// backends lists every netstack implementation in the build; gvisor_test.go adds
-// gvisor when it is compiled in. Close semantics are part of the tun.Device
-// contract, so each backend must pass the same tests.
-var backends = []backend{
-	{"lneto", CreateNetTUNLneto},
-}
+// backends lists every netstack implementation in the build; gvisor_test.go and
+// lneto_test.go each add theirs when it is compiled in. Close semantics are part
+// of the tun.Device contract, so each backend must pass the same tests.
+var backends []backend
 
 // forEachBackend runs test as a subtest against a fresh device per backend.
 func forEachBackend(t *testing.T, test func(t *testing.T, newDev func() tun.Device)) {

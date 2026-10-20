@@ -1,4 +1,4 @@
-//go:build wglneto
+//go:build tinygo || wglneto
 
 /* SPDX-License-Identifier: MIT
  *
@@ -24,6 +24,10 @@ import (
 	"github.com/soypat/lneto/dns"
 	"golang.zx2c4.com/wireguard/tun"
 )
+
+func init() {
+	backends = append(backends, backend{"lneto", CreateNetTUNLneto})
+}
 
 // TestNet2_Construct is a regression test: the previous CreateNetTUNLneto omitted
 // TCPPoolConfig.NewBackoff, which made StackGo panic at construction.
