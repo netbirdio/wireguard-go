@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/tun"
+	"github.com/netbirdio/wireguard-go/conn"
+	"github.com/netbirdio/wireguard-go/tun"
 )
 
 type idleTUN struct {
