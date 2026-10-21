@@ -17,8 +17,8 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/tun"
+	"github.com/netbirdio/wireguard-go/conn"
+	"github.com/netbirdio/wireguard-go/tun"
 )
 
 /* Outbound flow
